@@ -1,0 +1,3 @@
+[submodule "mak-suite"]
+	path = mak-suite
+	url = https://github.com/terrafirma2021/mak-suite.git
