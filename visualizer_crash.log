@@ -1,0 +1,9 @@
+CRASH AT 2026-10-07 19:12:19
+Traceback (most recent call last):
+  File "c:\makcu-new-firmware-test\mouse_trajectory_canvas.py", line 509, in <module>
+    main()
+  File "c:\makcu-new-firmware-test\mouse_trajectory_canvas.py", line 496, in main
+    root.mainloop()
+  File "C:\Users\gosyp\.pyenv\pyenv-win\versions\3.11.9\Lib\tkinter\__init__.py", line 1504, in mainloop
+    self.tk.mainloop(n)
+KeyboardInterrupt

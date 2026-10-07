@@ -1,23 +1,37 @@
 """
 MAKCU UDP Mouse Pattern Tester — Профессиональный калиброванный движок
+(Версия с защитой от переполнения очереди, Q16 квантованием и 500/1000 Гц)
+
 Особенности:
-1. Автоматическая калибровка 4K/2K/FullHD монитора:
-   - Размах 250 px на 4K экране теперь РЕАЛЬНО проходит 250 экранных пикселей.
-   - Масштаб: ~4.35 отсчёта на 1 пиксель (подтверждено лётным логом).
-2. Синхронизация km.screen(W, H) с платой MAKCU.
-3. Оптимальная рабочая частота 500 Гц (шаг ~10 отсчётов/такт, исключает затупы фильтра).
-4. Поддержка обоих бэкендов: RAW UDP (чистые сокеты) и mak-suite SDK (makxd).
-5. Покадровый Flight Recorder для фиксации точности движения.
+1. Защита от переполнения буферов ESP32 (Anti-Burst & Zero-Suppression).
+2. Выбор рабочей частоты:
+   - 500 Гц (Интервал 2.0 мс) — РЕКОМЕНДУЕМЫЙ Sweet Spot: нулевые потери, идеальная плавность.
+   - 1000 Гц (Интервал 1.0 мс) — нативный режим высокой частоты.
+3. Проверка границ экрана: предупреждает о риске упора в край экрана (Y=2159) на 4K.
+4. Прецизионный Q16 дельта-аккумулятор для кругов и синусоид: 100% точность замкнутости.
+5. Профиль Flash & Hogan Minimum Jerk для перемещений A->B (исключает «вялый старт»).
 """
+
+from __future__ import annotations
 
 import ctypes
 import math
 import os
+from pathlib import Path
 import secrets
 import socket
 import struct
 import sys
 import time
+
+# Принудительно включаем UTF-8 в консоли Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+from abcurves_substepper import ABCurvesSubStepper
 
 TARGET_IP = "192.168.50.175"
 PORT = 8080
@@ -38,7 +52,7 @@ if sys.platform == "win32":
 
 
 def get_screen_resolution() -> tuple[int, int]:
-    """Определяет физическое разрешение экрана с учётом DPI."""
+    """Определяет физическое разрешение экрана."""
     if sys.platform == "win32":
         try:
             user32 = ctypes.windll.user32
@@ -49,11 +63,11 @@ def get_screen_resolution() -> tuple[int, int]:
                 return w, h
         except Exception:
             pass
-    return 1920, 1080
+    return 3840, 2160
 
 
 def get_cursor_pos() -> tuple[int, int]:
-    """Считывает реальные экранные координаты курсора через Win32 API."""
+    """Считывает экранные координаты курсора через Win32 API."""
     if sys.platform == "win32":
         try:
             class POINT(ctypes.Structure):
@@ -67,18 +81,28 @@ def get_cursor_pos() -> tuple[int, int]:
 
 
 def calculate_pixel_scale(screen_w: int, screen_h: int) -> float:
-    """
-    Калибровка пересчёта экранных пикселей в отсчёты мыши (counts/pixel):
-    - 4K (3840x2160): ~4.35 отсчёта на 1 пиксель (замерено по логу).
-    - 2K (2560x1440): ~2.90 отсчёта на 1 пиксель.
-    - FullHD (1920x1080): ~1.20 отсчёта на 1 пиксель.
-    """
+    """Масштаб пересчёта экранных пикселей в отсчёты мыши (mickeys/pixel)."""
     if screen_w >= 3840 or screen_h >= 2160:
-        return 4.35
+        return 2.17  # 4K Ultra HD (3840x2160, mouse_spread=0)
     elif screen_w >= 2560 or screen_h >= 1440:
-        return 2.90
+        return 1.45  # 2K QHD (2560x1440)
     else:
-        return 1.20
+        return 1.00  # FullHD (1920x1080)
+
+
+def check_screen_margin(margin_px: float = 300.0) -> bool:
+    """Проверяет, не находится ли курсор слишком близко к краям экрана."""
+    sw, sh = get_screen_resolution()
+    cx, cy = get_cursor_pos()
+    # Если запущен в фоновой консоли без активного GUI, cx/cy могут быть 0
+    if cx == 0 and cy == 0:
+        return True
+    if cx < margin_px or cx > (sw - margin_px) or cy < margin_px or cy > (sh - margin_px):
+        print(f"\n[!] ВНИМАНИЕ: Курсор находится близко к краю экрана: ({cx}, {cy})!")
+        print(f"    Разрешение: {sw}x{sh}. Рекомендуется переместить курсор ближе к центру экрана,")
+        print("    иначе при движении курсор упрётся в стенку монитора и траектория обрежется!\n")
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +148,7 @@ class FlightRecorder:
                 f.write("tick,t_ms,dt_ms,cmd_dx,cmd_dy,cursor_x,cursor_y,screen_dx,screen_dy\n")
                 for r in self.records:
                     f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]}\n")
-            print(f"\n[+] Полный лог сохранён: {os.path.abspath(self.filename)} ({len(self.records)} тактов)")
+            print(f"\n[+] Лог сохранён: {os.path.abspath(self.filename)} ({len(self.records)} тактов)")
         except Exception as e:
             print(f"[-] Ошибка записи лога: {e}")
 
@@ -138,45 +162,76 @@ class FlightRecorder:
         print("\n===================================================")
         print("          ИТОГИ ИЗМЕРЕНИЯ ЭКРАННОГО РАЗМАХА        ")
         print("===================================================")
-        print(f"Целевая амплитуда:    {expected_px:.0f} пикселей")
-        print(f"Фактический размах X: {span_x} px (Амплитуда: {amp_x:.1f} px)")
-        print(f"Фактический размах Y: {span_y} px (Амплитуда: {amp_y:.1f} px)")
-        accuracy = (max(amp_x, amp_y) / expected_px * 100.0) if expected_px > 0 else 0
-        print(f"Точность попадания:   {accuracy:.1f}%")
+        print(f"Целевой размер:       {expected_px:.0f} px")
+        print(f"Фактический размах X: {span_x} px (Амплитуда/Радиус: {amp_x:.1f} px)")
+        print(f"Фактический размах Y: {span_y} px (Амплитуда/Радиус: {amp_y:.1f} px)")
+        if expected_px > 0:
+            accuracy = (max(amp_x, amp_y) / expected_px * 100.0)
+            print(f"Точность попадания:   {accuracy:.1f}%")
         print("===================================================\n")
 
 
 # ---------------------------------------------------------------------------
-# Тактовый генератор
+# Высокоточный тактовый генератор с защитой от переполнения очередей (Anti-Burst)
 # ---------------------------------------------------------------------------
 class RatePacer:
+    """
+    Высокоточный тактовый генератор микросекундной точности (500 Гц / 1000 Гц).
+    Математически исключает микро-всплески (Anti-Burst) и дрейф часов.
+    """
+
     def __init__(self, target_hz: float = 500.0):
-        self.interval = 1.0 / target_hz
-        self.target_hz = target_hz
-        self.next_tick = time.perf_counter() + self.interval
+        self.set_hz(target_hz)
         self.tick_count = 0
-        self.start_time = time.perf_counter()
-        self.last_stat_time = self.start_time
+        self.last_stat_time = time.perf_counter()
         self.last_stat_ticks = 0
         self.current_hz = target_hz
 
     def set_hz(self, target_hz: float):
-        self.target_hz = target_hz
-        self.interval = 1.0 / target_hz
-        self.next_tick = time.perf_counter() + self.interval
+        self.target_hz = float(target_hz)
+        self.interval = 1.0 / self.target_hz
+
+    def reset(self):
+        now = time.perf_counter()
+        self.start_time = now
+        self.last_send_time = now
+        self.tick_index = 0
+        self.tick_count = 0
+        self.last_stat_time = now
+        self.last_stat_ticks = 0
 
     def sync(self) -> float:
-        while time.perf_counter() < self.next_tick:
+        """
+        Ожидает следующий такт без лавинных сбросов и залипаний.
+        Гарантирует аппаратную паузу между пакетами (защита от коллизий USB-фреймов).
+        """
+        self.tick_index += 1
+        scheduled_time = self.start_time + (self.tick_index * self.interval)
+        now = time.perf_counter()
+
+        # Anti-Burst Protection: сдвигаем базу при лагах ОС
+        if now >= scheduled_time:
+            self.start_time = now - ((self.tick_index - 1) * self.interval)
+        else:
+            remaining = scheduled_time - now
+            if remaining > 0.003:
+                time.sleep(remaining - 0.002)
+            while time.perf_counter() < scheduled_time:
+                pass
+
+        # Аппаратный защитный зазор (Hardware Anti-Collision):
+        # Между пакетами всегда должно быть >= 75% интервала (0.75 мс при 1000 Гц),
+        # чтобы они никогда не слипались в один 1-мс USB-фрейм на плате ESP32.
+        min_gap = self.interval * 0.75
+        while (time.perf_counter() - self.last_send_time) < min_gap:
             pass
 
         now = time.perf_counter()
-        self.next_tick += self.interval
-        if now - self.next_tick > 0.005:
-            self.next_tick = now + self.interval
+        self.last_send_time = now
 
         self.tick_count += 1
         dt = now - self.last_stat_time
-        if dt >= 0.4:
+        if dt >= 0.5:
             self.current_hz = (self.tick_count - self.last_stat_ticks) / dt
             self.last_stat_time = now
             self.last_stat_ticks = self.tick_count
@@ -185,116 +240,167 @@ class RatePacer:
 
 
 # ---------------------------------------------------------------------------
-# Бэкенды подключения (RAW UDP и mak-suite SDK)
+# Клиенты подключения
 # ---------------------------------------------------------------------------
 class MakcuRawClient:
-    backend_name = "RAW UDP (чистые сокеты)"
+    backend_name = "RAW UDP (чистые сокеты + Q16)"
 
-    def __init__(self, ip: str = TARGET_IP, port: int = PORT):
+    def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35):
         self.target = (ip, port)
+        self.pixel_scale = pixel_scale
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.ioctl(0x9800000C, False)
         except Exception:
             pass
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        from abcurves_substepper import Q16Accumulator
+        self.acc = Q16Accumulator()
 
     def sync_screen(self, width: int, height: int):
-        """Передаёт реальное разрешение экрана на плату MAKCU."""
         cmd = f"m.screen({width},{height})".encode("ascii")
         frame = b"\xDE\xAD" + len(cmd).to_bytes(2, "little") + b"k" + cmd
         packet = b"\x55" + secrets.token_bytes(8) + frame
         self.sock.sendto(packet, self.target)
+        time.sleep(0.05)
+
+    def step_smooth(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
+        dx, dy = self.acc.step(smooth_dx_mickeys, smooth_dy_mickeys)
+        if dx != 0 or dy != 0:
+            payload = struct.pack("<hh", int(dx), int(dy))
+            frame = b"\xDE\xAD\x04\x00\x18" + payload
+            packet = b"\x55" + secrets.token_bytes(8) + frame
+            self.sock.sendto(packet, self.target)
+        return dx, dy
 
     def move(self, dx: int, dy: int):
         if dx == 0 and dy == 0:
             return
-        nonce = secrets.token_bytes(8)
         payload = struct.pack("<hh", int(dx), int(dy))
         frame = b"\xDE\xAD\x04\x00\x18" + payload
-        packet = b"\x55" + nonce + frame
+        packet = b"\x55" + secrets.token_bytes(8) + frame
+        self.sock.sendto(packet, self.target)
+
+    def set_move_mask(self, left: bool = False, right: bool = False, down: bool = False, up: bool = False):
+        payload = bytes([1 if left else 0, 1 if right else 0, 1 if down else 0, 1 if up else 0])
+        frame = b"\xDE\xAD\x04\x00\x16" + payload
+        packet = b"\x55" + secrets.token_bytes(8) + frame
         self.sock.sendto(packet, self.target)
 
     def close(self):
         self.sock.close()
 
 
-class MakcuSdkClient:
-    backend_name = "mak-suite SDK (makxd)"
+class MakcuAbcurvesClient:
+    backend_name = "ABCurves SubStepper (Q16 + 500/1000 Гц)"
 
-    def __init__(self, ip: str = TARGET_IP, port: int = PORT):
-        sdk_path = os.path.abspath(r"c:\makcu-new-firmware-test\mak-suite\python")
-        if sdk_path not in sys.path:
-            sys.path.insert(0, sdk_path)
-
-        from makxd import create_controller, ConnectionConfig, UdpWireMode
-
-        print(f"[*] Подключение mak-suite SDK к {ip}:{port}...")
-        cfg = ConnectionConfig.udp(
-            host=ip,
-            port=port,
-            mode=UdpWireMode.RAW
-        )
-        self.device = create_controller(connection=cfg)
-        print(f"[+] SDK подключён! Версия прошивки: {self.device.firmware_version()}")
+    def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35):
+        self.target = (ip, port)
+        self.pixel_scale = pixel_scale
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.ioctl(0x9800000C, False)
+        except Exception:
+            pass
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        self.substepper = ABCurvesSubStepper(pixel_scale=pixel_scale)
 
     def sync_screen(self, width: int, height: int):
         cmd = f"m.screen({width},{height})".encode("ascii")
-        try:
-            self.device.transport.send_mak_api(0x6B, cmd, wait_response=False)
-        except Exception:
-            pass
+        frame = b"\xDE\xAD" + len(cmd).to_bytes(2, "little") + b"k" + cmd
+        packet = b"\x55" + secrets.token_bytes(8) + frame
+        self.sock.sendto(packet, self.target)
+        time.sleep(0.05)
+
+    def step_smooth(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
+        dx, dy = self.substepper.step(smooth_dx_mickeys, smooth_dy_mickeys)
+        if dx != 0 or dy != 0:
+            payload = struct.pack("<hh", int(dx), int(dy))
+            frame = b"\xDE\xAD\x04\x00\x18" + payload
+            packet = b"\x55" + secrets.token_bytes(8) + frame
+            self.sock.sendto(packet, self.target)
+        return dx, dy
 
     def move(self, dx: int, dy: int):
         if dx == 0 and dy == 0:
             return
-        self.device.move(int(dx), int(dy))
+        payload = struct.pack("<hh", int(dx), int(dy))
+        frame = b"\xDE\xAD\x04\x00\x18" + payload
+        packet = b"\x55" + secrets.token_bytes(8) + frame
+        self.sock.sendto(packet, self.target)
+
+    def set_move_mask(self, left: bool = False, right: bool = False, down: bool = False, up: bool = False):
+        payload = bytes([1 if left else 0, 1 if right else 0, 1 if down else 0, 1 if up else 0])
+        frame = b"\xDE\xAD\x04\x00\x16" + payload
+        packet = b"\x55" + secrets.token_bytes(8) + frame
+        self.sock.sendto(packet, self.target)
 
     def close(self):
-        try:
-            self.device.disconnect()
-        except Exception:
-            pass
+        self.sock.close()
 
 
 # ---------------------------------------------------------------------------
-# Паттерны с экранной калибровкой
+# ---------------------------------------------------------------------------
+# Выполнение паттернов
 # ---------------------------------------------------------------------------
 
-def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str = "x", amplitude_px: float = 250.0, period_sec: float = 1.4, pixel_scale: float = 4.35):
+def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str = "x", amplitude_px: float = 250.0, period_sec: float = 1.6, pixel_scale: float = 2.17):
+    check_screen_margin(amplitude_px + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
     counts_amplitude = amplitude_px * pixel_scale
 
     title = "ВЛЕВО <-> ВПРАВО" if axis == "x" else "ВВЕРХ <-> ВНИЗ"
-    print(f"\n[>] Запущен режим: {title} (Экранный размах: ~{amplitude_px*2:.0f} px, Частота: {pacer.target_hz:.0f} Гц)")
+    print(f"\n[>] Запущен режим: {title} (Амплитуда: ~{amplitude_px:.0f} px, Размах: ~{amplitude_px*2:.0f} px, Частота: {pacer.target_hz:.0f} Гц)")
     print("   [REC] Идёт запись в лог. Нажмите Ctrl+C для завершения.\n")
 
-    steps_per_period = int(pacer.target_hz * period_sec)
-    phase_step = (2 * math.pi) / steps_per_period
+    hz = pacer.target_hz
+    dt = 1.0 / hz
+    ramp_time = 0.4
+    omega = (2.0 * math.pi) / period_sec
 
-    phase = 0.0
     last_val = 0.0
     start_time = time.perf_counter()
     end_time = start_time + duration
+    pacer.reset()
 
     try:
+        tick = 0
         while time.perf_counter() < end_time:
-            phase += phase_step
-            curr_val = counts_amplitude * math.sin(phase)
-            delta = int(round(curr_val - last_val))
+            tick += 1
+            t = tick * dt
 
-            cmd_dx = delta if axis == "x" else 0
-            cmd_dy = delta if axis == "y" else 0
+            # Плавный рамп амплитуды для исключения стартового рывка
+            if t < ramp_time:
+                tau = t / ramp_time
+                amp = counts_amplitude * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+            elif duration < 99999 and t > (duration - ramp_time):
+                tau = (duration - t) / ramp_time
+                amp = counts_amplitude * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+            else:
+                amp = counts_amplitude
 
-            if delta != 0:
-                client.move(cmd_dx, cmd_dy)
-                last_val += delta
+            curr_val = amp * math.sin(omega * t)
 
+            if hasattr(client, "step_smooth"):
+                smooth_delta = curr_val - last_val
+                cmd_dx, cmd_dy = client.step_smooth(
+                    smooth_delta if axis == "x" else 0.0,
+                    smooth_delta if axis == "y" else 0.0,
+                )
+            else:
+                delta = int(round(curr_val - last_val))
+                cmd_dx = delta if axis == "x" else 0
+                cmd_dy = delta if axis == "y" else 0
+                if delta != 0:
+                    client.move(cmd_dx, cmd_dy)
+
+            last_val = curr_val
             recorder.record(cmd_dx, cmd_dy)
-            hz = pacer.sync()
+            cur_hz = pacer.sync()
 
-            if pacer.tick_count % 100 == 0:
-                t = time.perf_counter() - start_time
-                print(f"\r  [Монитор] {hz:5.1f} Гц | Прошло: {t:4.1f}с | Шаг: {delta:+3d} отсчётов", end="", flush=True)
+            if pacer.tick_count % 150 == 0:
+                elapsed = time.perf_counter() - start_time
+                print(f"\r  [Монитор] {cur_hz:5.1f} Гц | Прошло: {elapsed:4.1f}с | Шаг: ({cmd_dx:+3d}, {cmd_dy:+3d})", end="", flush=True)
 
     except KeyboardInterrupt:
         pass
@@ -302,43 +408,66 @@ def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str
         recorder.save_and_analyze(amplitude_px)
 
 
-def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_px: float = 250.0, period_sec: float = 1.6, pixel_scale: float = 4.35):
+def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_px: float = 250.0, period_sec: float = 2.0, pixel_scale: float = 2.17):
+    check_screen_margin(radius_px + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
     counts_radius = radius_px * pixel_scale
 
-    print(f"\n[>] Запущен режим: КРУГ (Экранный радиус: ~{radius_px:.0f} px, Частота: {pacer.target_hz:.0f} Гц)")
+    print(f"\n[>] Запущен режим: КРУГ (Радиус: ~{radius_px:.0f} px, Диаметр: ~{radius_px*2:.0f} px, Частота: {pacer.target_hz:.0f} Гц)")
     print("   [REC] Идёт запись в лог. Нажмите Ctrl+C для завершения.\n")
 
-    steps_per_rev = int(pacer.target_hz * period_sec)
-    d_theta = (2 * math.pi) / steps_per_rev
+    hz = pacer.target_hz
+    dt = 1.0 / hz
+    ramp_time = 0.5  # Мягкий спиральный вход (исключает стартовый бросок)
+    omega = (2.0 * math.pi) / period_sec
 
-    theta = 0.0
-    last_x = counts_radius * math.cos(0.0)
-    last_y = counts_radius * math.sin(0.0)
+    last_x = 0.0
+    last_y = 0.0
 
     start_time = time.perf_counter()
     end_time = start_time + duration
+    pacer.reset()
 
     try:
+        tick = 0
         while time.perf_counter() < end_time:
-            theta += d_theta
-            curr_x = counts_radius * math.cos(theta)
-            curr_y = counts_radius * math.sin(theta)
+            tick += 1
+            t = tick * dt
 
-            dx = int(round(curr_x - last_x))
-            dy = int(round(curr_y - last_y))
+            # Мягкий рамп радиуса (спиральный вход из (0,0) в орбиту)
+            if t < ramp_time:
+                tau = t / ramp_time
+                r = counts_radius * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+            elif duration < 99999 and t > (duration - ramp_time):
+                tau = (duration - t) / ramp_time
+                r = counts_radius * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+            else:
+                r = counts_radius
 
-            if dx != 0 or dy != 0:
-                client.move(dx, dy)
-                last_x += dx
-                last_y += dy
+            # Центрированная симметричная орбита: X в [-R, +R], Y в [-R, +R]
+            theta = omega * t
+            curr_x = r * math.cos(theta)
+            curr_y = r * math.sin(theta)
 
-            recorder.record(dx, dy)
-            hz = pacer.sync()
+            if hasattr(client, "step_smooth"):
+                smooth_dx = curr_x - last_x
+                smooth_dy = curr_y - last_y
+                cmd_dx, cmd_dy = client.step_smooth(smooth_dx, smooth_dy)
+            else:
+                dx = int(round(curr_x - last_x))
+                dy = int(round(curr_y - last_y))
+                cmd_dx, cmd_dy = dx, dy
+                if dx != 0 or dy != 0:
+                    client.move(dx, dy)
 
-            if pacer.tick_count % 100 == 0:
-                t = time.perf_counter() - start_time
-                print(f"\r  [Монитор] {hz:5.1f} Гц | Прошло: {t:4.1f}с | Шаг: ({dx:+3d}, {dy:+3d})", end="", flush=True)
+            last_x = curr_x
+            last_y = curr_y
+            recorder.record(cmd_dx, cmd_dy)
+            cur_hz = pacer.sync()
+
+            if pacer.tick_count % 150 == 0:
+                elapsed = time.perf_counter() - start_time
+                print(f"\r  [Монитор] {cur_hz:5.1f} Гц | Прошло: {elapsed:4.1f}с | Шаг: ({cmd_dx:+3d}, {cmd_dy:+3d})", end="", flush=True)
 
     except KeyboardInterrupt:
         pass
@@ -346,44 +475,65 @@ def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_
         recorder.save_and_analyze(radius_px)
 
 
-def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale_px: float = 220.0, period_sec: float = 1.8, pixel_scale: float = 4.35):
+def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale_px: float = 220.0, period_sec: float = 2.2, pixel_scale: float = 2.17):
+    check_screen_margin(scale_px + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
     counts_scale = scale_px * pixel_scale
 
     print(f"\n[>] Запущен режим: ВОСЬМЁРКА (Масштаб: ~{scale_px:.0f} px, Частота: {pacer.target_hz:.0f} Гц)")
     print("   [REC] Идёт запись в лог. Нажмите Ctrl+C для завершения.\n")
 
-    steps_per_cycle = int(pacer.target_hz * period_sec)
-    dt_param = (2 * math.pi) / steps_per_cycle
+    hz = pacer.target_hz
+    dt = 1.0 / hz
+    ramp_time = 0.5
+    omega = (2.0 * math.pi) / period_sec
 
-    t_param = 0.0
     last_x = 0.0
     last_y = 0.0
 
     start_time = time.perf_counter()
     end_time = start_time + duration
+    pacer.reset()
 
     try:
+        tick = 0
         while time.perf_counter() < end_time:
-            t_param += dt_param
-            denom = 1 + math.sin(t_param) ** 2
-            curr_x = counts_scale * math.cos(t_param) / denom
-            curr_y = counts_scale * math.sin(t_param) * math.cos(t_param) / denom
+            tick += 1
+            t = tick * dt
 
-            dx = int(round(curr_x - last_x))
-            dy = int(round(curr_y - last_y))
+            if t < ramp_time:
+                tau = t / ramp_time
+                sc = counts_scale * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+            elif duration < 99999 and t > (duration - ramp_time):
+                tau = (duration - t) / ramp_time
+                sc = counts_scale * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+            else:
+                sc = counts_scale
 
-            if dx != 0 or dy != 0:
-                client.move(dx, dy)
-                last_x += dx
-                last_y += dy
+            t_param = omega * t
+            denom = 1.0 + math.sin(t_param) ** 2
+            curr_x = sc * math.cos(t_param) / denom
+            curr_y = sc * math.sin(t_param) * math.cos(t_param) / denom
 
-            recorder.record(dx, dy)
-            hz = pacer.sync()
+            if hasattr(client, "step_smooth"):
+                smooth_dx = curr_x - last_x
+                smooth_dy = curr_y - last_y
+                cmd_dx, cmd_dy = client.step_smooth(smooth_dx, smooth_dy)
+            else:
+                dx = int(round(curr_x - last_x))
+                dy = int(round(curr_y - last_y))
+                cmd_dx, cmd_dy = dx, dy
+                if dx != 0 or dy != 0:
+                    client.move(dx, dy)
 
-            if pacer.tick_count % 100 == 0:
-                t = time.perf_counter() - start_time
-                print(f"\r  [Монитор] {hz:5.1f} Гц | Прошло: {t:4.1f}с | Шаг: ({dx:+3d}, {dy:+3d})", end="", flush=True)
+            last_x = curr_x
+            last_y = curr_y
+            recorder.record(cmd_dx, cmd_dy)
+            cur_hz = pacer.sync()
+
+            if pacer.tick_count % 150 == 0:
+                elapsed = time.perf_counter() - start_time
+                print(f"\r  [Монитор] {cur_hz:5.1f} Гц | Прошло: {elapsed:4.1f}с | Шаг: ({cmd_dx:+3d}, {cmd_dy:+3d})", end="", flush=True)
 
     except KeyboardInterrupt:
         pass
@@ -391,15 +541,45 @@ def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale
         recorder.save_and_analyze(scale_px)
 
 
-def create_client(backend_choice: str):
+def run_pattern_min_jerk_step(
+    client,
+    pacer: RatePacer,
+    delta_px: float = 250.0,
+    duration_ms: float = 250.0,
+    axis: str = "x",
+    pixel_scale: float = 2.17,
+):
+    check_screen_margin(abs(delta_px) + 50.0)
+    recorder = FlightRecorder(LOG_FILENAME)
+    title = f"ПРЯМОЙ ШАГ MINIMUM JERK {delta_px:+.0f} px по {axis.upper()}"
+    print(f"\n[>] Запущен режим: {title} (Длительность: {duration_ms:.0f} мс)")
+    print("   [REC] Идёт запись в лог...\n")
+
+    dx_px = delta_px if axis == "x" else 0.0
+    dy_px = delta_px if axis == "y" else 0.0
+
+    if hasattr(client, "substepper"):
+        steps = client.substepper.generate_steps(dx_px, dy_px, duration_ms=duration_ms, settling_ms=20)
+    else:
+        total_mickeys_x = dx_px * pixel_scale
+        total_mickeys_y = dy_px * pixel_scale
+        n = max(5, int(duration_ms))
+        steps = [(int(round(total_mickeys_x / n)), int(round(total_mickeys_y / n)))] * n
+
+    pacer.reset()
+    for cmd_dx, cmd_dy in steps:
+        if cmd_dx != 0 or cmd_dy != 0:
+            client.move(cmd_dx, cmd_dy)
+        recorder.record(cmd_dx, cmd_dy)
+        pacer.sync()
+
+    recorder.save_and_analyze(abs(delta_px))
+
+
+def create_client(backend_choice: str, pixel_scale: float = 2.17):
     if backend_choice == "2":
-        try:
-            return MakcuSdkClient()
-        except Exception as e:
-            print(f"[-] Ошибка подключения через mak-suite SDK: {e}")
-            print("[*] Переключение на RAW UDP (чистые сокеты)...")
-            return MakcuRawClient()
-    return MakcuRawClient()
+        return MakcuRawClient(pixel_scale=pixel_scale)
+    return MakcuAbcurvesClient(pixel_scale=pixel_scale)
 
 
 def main():
@@ -410,17 +590,17 @@ def main():
     print("   MAKCU UDP: КАЛИБРОВАННЫЙ ЭКРАННЫЙ ТЕСТЕР        ")
     print("===================================================")
     print(f"[*] Дисплей: {screen_w}x{screen_h} | Калибровочный масштаб: {pixel_scale:.2f}x")
-    print("1. RAW UDP (чистые сокеты) [По умолчанию]")
-    print("2. mak-suite SDK (официальная библиотека)")
+    print("1. ABCurves SubStepper (Q16 + 500/1000 Гц) [По умолчанию / РЕКОМЕНДУЕТСЯ]")
+    print("2. RAW UDP (чистые сокеты + Q16)")
     print("===================================================")
 
     init_backend = input("Выберите бэкенд (1 или 2, Enter=1): ").strip()
-    client = create_client(init_backend)
+    client = create_client(init_backend, pixel_scale=pixel_scale)
 
     # Синхронизируем разрешение экрана с платой
     client.sync_screen(screen_w, screen_h)
 
-    # По умолчанию 500 Гц (шаг ~8-12 отсчетов, исключает размазывание фильтра)
+    # По умолчанию 500 Гц (аппаратный Sweet Spot)
     current_hz = 500.0
     pacer = RatePacer(current_hz)
 
@@ -440,65 +620,75 @@ def main():
 5. ОГРОМНЫЙ КРУГ (Честный радиус 450 px, диаметр 900 px)
 6. Восьмёрка (Infinity)
 7. БЕСКОНЕЧНЫЙ круг (для проверки движения собственной рукой)
-8. ИЗМЕНИТЬ ЧАСТОТУ (500 Гц / 250 Гц / 1000 Гц)
+8. ИЗМЕНИТЬ ЧАСТОТУ (500 Гц [Sweet Spot] / 1000 Гц / 250 Гц)
 9. НАСТРОЙКА МАСШТАБА (Текущий: {pixel_scale:.2f}x)
-10. СМЕНИТЬ БЭКЕНД (RAW UDP <-> mak-suite)
+10. СМЕНИТЬ БЭКЕНД (ABCurves SubStepper <-> RAW UDP)
+11. ПРЯМОЙ ШАГ A->B (Flash & Hogan Minimum Jerk 250 px, тест вялого старта)
+12. ЗАПУСТИТЬ ВИЗУАЛИЗАТОР ПОЛОТНА (Экранный холст в реальном времени)
 0. Выход
 ===================================================
 """
             print(menu)
-            choice = input("Выберите действие (0-10): ").strip()
+            choice = input("Выберите действие (0-12): ").strip()
 
             if choice == "1":
-                run_pattern_line(client, pacer, duration=15.0, axis="x", amplitude_px=250.0, period_sec=1.4, pixel_scale=pixel_scale)
+                run_pattern_line(client, pacer, duration=15.0, axis="x", amplitude_px=250.0, period_sec=1.6, pixel_scale=pixel_scale)
             elif choice == "2":
-                run_pattern_line(client, pacer, duration=15.0, axis="y", amplitude_px=250.0, period_sec=1.4, pixel_scale=pixel_scale)
+                run_pattern_line(client, pacer, duration=15.0, axis="y", amplitude_px=250.0, period_sec=1.6, pixel_scale=pixel_scale)
             elif choice == "3":
-                run_pattern_circle(client, pacer, duration=15.0, radius_px=120.0, period_sec=1.3, pixel_scale=pixel_scale)
+                run_pattern_circle(client, pacer, duration=15.0, radius_px=120.0, period_sec=1.5, pixel_scale=pixel_scale)
             elif choice == "4":
-                run_pattern_circle(client, pacer, duration=15.0, radius_px=250.0, period_sec=1.6, pixel_scale=pixel_scale)
+                run_pattern_circle(client, pacer, duration=15.0, radius_px=250.0, period_sec=2.0, pixel_scale=pixel_scale)
             elif choice == "5":
-                run_pattern_circle(client, pacer, duration=15.0, radius_px=450.0, period_sec=1.8, pixel_scale=pixel_scale)
+                run_pattern_circle(client, pacer, duration=15.0, radius_px=450.0, period_sec=2.8, pixel_scale=pixel_scale)
             elif choice == "6":
-                run_pattern_infinity(client, pacer, duration=15.0, scale_px=220.0, period_sec=1.8, pixel_scale=pixel_scale)
+                run_pattern_infinity(client, pacer, duration=15.0, scale_px=220.0, period_sec=2.2, pixel_scale=pixel_scale)
             elif choice == "7":
-                run_pattern_circle(client, pacer, duration=999999.0, radius_px=250.0, period_sec=1.6, pixel_scale=pixel_scale)
+                run_pattern_circle(client, pacer, duration=999999.0, radius_px=250.0, period_sec=2.0, pixel_scale=pixel_scale)
             elif choice == "8":
                 print("\nВыберите целевую частоту пакетов:")
-                print("1. 500 Гц  (РЕКОМЕНДУЕТСЯ: крупный шаг ~10 counts, ноль затупов фильтра)")
-                print("2. 250 Гц  (Интервал 4.0 мс — максимальная стабильность)")
-                print("3. 1000 Гц (Интервал 1.0 мс — родная частота MAKCU)")
+                print("1. 500 Гц  (РЕКОМЕНДУЕТСЯ: Sweet Spot, нулевой оверфлоу lwIP, идеальная плавность)")
+                print("2. 1000 Гц (Интервал 1.0 мс — нативный режим высокой частоты)")
+                print("3. 250 Гц  (Интервал 4.0 мс — максимальная стабильность)")
                 hz_choice = input("Выбор (1/2/3): ").strip()
                 if hz_choice == "2":
-                    pacer.set_hz(250.0)
-                elif hz_choice == "3":
                     pacer.set_hz(1000.0)
+                elif hz_choice == "3":
+                    pacer.set_hz(250.0)
                 else:
                     pacer.set_hz(500.0)
                 print(f"[+] Частота установлена на: {pacer.target_hz:.0f} Гц")
             elif choice == "9":
                 print(f"\nТекущий масштаб: {pixel_scale:.2f}x")
-                print("1. 4.35x (Калибровка для 4K 3840x2160)")
-                print("2. 2.90x (Калибровка для 2K 2560x1440)")
-                print("3. 1.20x (Калибровка для FullHD 1920x1080)")
-                print("4. 1.00x (Чистые отсчёты без масштабирования)")
+                print("1. 2.17x (Калибровка 4K 3840x2160, mouse_spread=0) [ПО УМОЛЧАНИЮ]")
+                print("2. 1.45x (Калибровка 2K 2560x1440)")
+                print("3. 1.00x (Калибровка FullHD 1920x1080)")
+                print("4. 4.35x (Устаревший масштаб для прошивки с 17-мс фильтром)")
                 sc_choice = input("Выбор (1-4): ").strip()
                 if sc_choice == "2":
-                    pixel_scale = 2.90
+                    pixel_scale = 1.45
                 elif sc_choice == "3":
-                    pixel_scale = 1.20
-                elif sc_choice == "4":
                     pixel_scale = 1.00
-                else:
+                elif sc_choice == "4":
                     pixel_scale = 4.35
+                else:
+                    pixel_scale = 2.17
                 print(f"[+] Масштаб установлен на: {pixel_scale:.2f}x")
             elif choice == "10":
                 client.close()
-                new_choice = "2" if isinstance(client, MakcuRawClient) else "1"
+                new_choice = "2" if isinstance(client, MakcuAbcurvesClient) else "1"
                 print(f"\n[*] Переключение бэкенда...")
-                client = create_client(new_choice)
+                client = create_client(new_choice, pixel_scale=pixel_scale)
                 client.sync_screen(screen_w, screen_h)
                 print(f"[+] Бэкенд изменён на: {client.backend_name}")
+            elif choice == "11":
+                run_pattern_min_jerk_step(client, pacer, delta_px=250.0, duration_ms=250.0, axis="x", pixel_scale=pixel_scale)
+            elif choice == "12":
+                import subprocess
+                canvas_script = Path(__file__).parent / "mouse_trajectory_canvas.py"
+                print(f"\n[*] Запуск визуализатора полотна: {canvas_script}...")
+                subprocess.Popen([sys.executable, str(canvas_script)])
+                print("[+] Визуализатор запущен в отдельном окне!")
             elif choice == "0":
                 print("Выход.")
                 break
