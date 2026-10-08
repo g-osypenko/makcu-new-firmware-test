@@ -245,9 +245,10 @@ class RatePacer:
 class MakcuRawClient:
     backend_name = "RAW UDP (чистые сокеты + Q16)"
 
-    def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35):
+    def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35, use_move_now: bool = True):
         self.target = (ip, port)
         self.pixel_scale = pixel_scale
+        self.use_move_now = use_move_now
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.ioctl(0x9800000C, False)
@@ -264,22 +265,25 @@ class MakcuRawClient:
         self.sock.sendto(packet, self.target)
         time.sleep(0.05)
 
-    def step_smooth(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
-        dx, dy = self.acc.step(smooth_dx_mickeys, smooth_dy_mickeys)
-        if dx != 0 or dy != 0:
+    def _send_move(self, dx: int, dy: int):
+        if dx == 0 and dy == 0:
+            return
+        if self.use_move_now:
+            cmd = f"m.move_now({int(dx)},{int(dy)})\r\n".encode("ascii")
+            frame = b"\xDE\xAD" + len(cmd).to_bytes(2, "little") + b"\x6B" + cmd
+        else:
             payload = struct.pack("<hh", int(dx), int(dy))
             frame = b"\xDE\xAD\x04\x00\x18" + payload
-            packet = b"\x55" + secrets.token_bytes(8) + frame
-            self.sock.sendto(packet, self.target)
+        packet = b"\x55" + secrets.token_bytes(8) + frame
+        self.sock.sendto(packet, self.target)
+
+    def step_smooth(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
+        dx, dy = self.acc.step(smooth_dx_mickeys, smooth_dy_mickeys)
+        self._send_move(dx, dy)
         return dx, dy
 
     def move(self, dx: int, dy: int):
-        if dx == 0 and dy == 0:
-            return
-        payload = struct.pack("<hh", int(dx), int(dy))
-        frame = b"\xDE\xAD\x04\x00\x18" + payload
-        packet = b"\x55" + secrets.token_bytes(8) + frame
-        self.sock.sendto(packet, self.target)
+        self._send_move(dx, dy)
 
     def set_move_mask(self, left: bool = False, right: bool = False, down: bool = False, up: bool = False):
         payload = bytes([1 if left else 0, 1 if right else 0, 1 if down else 0, 1 if up else 0])
@@ -294,9 +298,10 @@ class MakcuRawClient:
 class MakcuAbcurvesClient:
     backend_name = "ABCurves SubStepper (Q16 + 500/1000 Гц)"
 
-    def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35):
+    def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35, use_move_now: bool = True):
         self.target = (ip, port)
         self.pixel_scale = pixel_scale
+        self.use_move_now = use_move_now
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.ioctl(0x9800000C, False)
@@ -312,22 +317,25 @@ class MakcuAbcurvesClient:
         self.sock.sendto(packet, self.target)
         time.sleep(0.05)
 
-    def step_smooth(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
-        dx, dy = self.substepper.step(smooth_dx_mickeys, smooth_dy_mickeys)
-        if dx != 0 or dy != 0:
+    def _send_move(self, dx: int, dy: int):
+        if dx == 0 and dy == 0:
+            return
+        if self.use_move_now:
+            cmd = f"m.move_now({int(dx)},{int(dy)})\r\n".encode("ascii")
+            frame = b"\xDE\xAD" + len(cmd).to_bytes(2, "little") + b"\x6B" + cmd
+        else:
             payload = struct.pack("<hh", int(dx), int(dy))
             frame = b"\xDE\xAD\x04\x00\x18" + payload
-            packet = b"\x55" + secrets.token_bytes(8) + frame
-            self.sock.sendto(packet, self.target)
+        packet = b"\x55" + secrets.token_bytes(8) + frame
+        self.sock.sendto(packet, self.target)
+
+    def step_smooth(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
+        dx, dy = self.substepper.step(smooth_dx_mickeys, smooth_dy_mickeys)
+        self._send_move(dx, dy)
         return dx, dy
 
     def move(self, dx: int, dy: int):
-        if dx == 0 and dy == 0:
-            return
-        payload = struct.pack("<hh", int(dx), int(dy))
-        frame = b"\xDE\xAD\x04\x00\x18" + payload
-        packet = b"\x55" + secrets.token_bytes(8) + frame
-        self.sock.sendto(packet, self.target)
+        self._send_move(dx, dy)
 
     def set_move_mask(self, left: bool = False, right: bool = False, down: bool = False, up: bool = False):
         payload = bytes([1 if left else 0, 1 if right else 0, 1 if down else 0, 1 if up else 0])
@@ -576,10 +584,40 @@ def run_pattern_min_jerk_step(
     recorder.save_and_analyze(abs(delta_px))
 
 
-def create_client(backend_choice: str, pixel_scale: float = 2.17):
+def get_device_mouse_spread() -> int | None:
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "mak-suite" / "python"))
+        from makxd import ConnectionConfig, create_controller, UdpWireMode
+        cfg = ConnectionConfig.udp(host=TARGET_IP, port=PORT, mode=UdpWireMode.RAW)
+        dev = create_controller(connection=cfg)
+        snap = dev.settings.read()
+        return snap.settings.mouse_spread_percent
+    except Exception:
+        return None
+
+
+def set_device_mouse_spread(percent: int, save_to_nor: bool = False) -> tuple[bool, str]:
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "mak-suite" / "python"))
+        from makxd import ConnectionConfig, create_controller, UdpWireMode, SettingsSection
+        cfg = ConnectionConfig.udp(host=TARGET_IP, port=PORT, mode=UdpWireMode.RAW)
+        dev = create_controller(connection=cfg)
+        snap = dev.settings.read()
+        target_val = max(0, min(100, int(percent)))
+        snap.settings.mouse_spread_percent = target_val
+        snap = dev.settings.apply(snap, SettingsSection.MOUSE)
+        if save_to_nor:
+            dev.settings.save(snap, SettingsSection.MOUSE)
+            return True, f"Успешно применено и сохранено в NOR-flash: {snap.settings.mouse_spread_percent}%"
+        return True, f"Успешно применено live: {snap.settings.mouse_spread_percent}% (без записи в flash)"
+    except Exception as e:
+        return False, f"Ошибка применения настроек: {e}"
+
+
+def create_client(backend_choice: str, pixel_scale: float = 2.17, use_move_now: bool = True):
     if backend_choice == "2":
-        return MakcuRawClient(pixel_scale=pixel_scale)
-    return MakcuAbcurvesClient(pixel_scale=pixel_scale)
+        return MakcuRawClient(pixel_scale=pixel_scale, use_move_now=use_move_now)
+    return MakcuAbcurvesClient(pixel_scale=pixel_scale, use_move_now=use_move_now)
 
 
 def main():
@@ -595,10 +633,13 @@ def main():
     print("===================================================")
 
     init_backend = input("Выберите бэкенд (1 или 2, Enter=1): ").strip()
-    client = create_client(init_backend, pixel_scale=pixel_scale)
+    client = create_client(init_backend, pixel_scale=pixel_scale, use_move_now=True)
 
     # Синхронизируем разрешение экрана с платой
     client.sync_screen(screen_w, screen_h)
+
+    # Загружаем текущий spread с платы
+    current_spread = get_device_mouse_spread()
 
     # По умолчанию 500 Гц (аппаратный Sweet Spot)
     current_hz = 500.0
@@ -606,10 +647,15 @@ def main():
 
     try:
         while True:
+            cmd_mode_str = "m.move_now (Обход 8мс очереди)" if getattr(client, "use_move_now", False) else "0x18 MOVE (Очередь MAKOS 8мс)"
+            spread_str = f"{current_spread}%" if current_spread is not None else "N/A"
+
             menu = f"""
 ===================================================
       MAKCU UDP: ЭКРАННЫЙ ТЕСТЕР (ЧЕСТНЫЕ ПИКСЕЛИ)
   Бэкенд:     [{client.backend_name}]
+  Команда:    [{cmd_mode_str}]
+  Сглаживание:[Spread: {spread_str}] (Аппаратное слияние векторов)
   Частота:    [{pacer.target_hz:.0f} Гц]  (Интервал: {pacer.interval*1000:.2f} мс)
   Разрешение: [{screen_w}x{screen_h}]  (Масштаб: {pixel_scale:.2f} отсчётов/пиксель)
 ===================================================
@@ -623,13 +669,15 @@ def main():
 8. ИЗМЕНИТЬ ЧАСТОТУ (500 Гц [Sweet Spot] / 1000 Гц / 250 Гц)
 9. НАСТРОЙКА МАСШТАБА (Текущий: {pixel_scale:.2f}x)
 10. СМЕНИТЬ БЭКЕНД (ABCurves SubStepper <-> RAW UDP)
-11. ПРЯМОЙ ШАГ A->B (Flash & Hogan Minimum Jerk 250 px, тест вялого старта)
-12. ЗАПУСТИТЬ ВИЗУАЛИЗАТОР ПОЛОТНА (Экранный холст в реальном времени)
+11. ПЕРЕКЛЮЧИТЬ КОМАНДУ (m.move_now <-> 0x18 MOVE)
+12. НАСТРОЙКА MOUSE SPREAD (Текущий: {spread_str}) [Аппаратное слияние]
+13. ПРЯМОЙ ШАГ A->B (Flash & Hogan Minimum Jerk 250 px)
+14. ЗАПУСТИТЬ ВИЗУАЛИЗАТОР ПОЛОТНА (Экранный холст в реальном времени)
 0. Выход
 ===================================================
 """
             print(menu)
-            choice = input("Выберите действие (0-12): ").strip()
+            choice = input("Выберите действие (0-14): ").strip()
 
             if choice == "1":
                 run_pattern_line(client, pacer, duration=15.0, axis="x", amplitude_px=250.0, period_sec=1.6, pixel_scale=pixel_scale)
@@ -678,12 +726,32 @@ def main():
                 client.close()
                 new_choice = "2" if isinstance(client, MakcuAbcurvesClient) else "1"
                 print(f"\n[*] Переключение бэкенда...")
-                client = create_client(new_choice, pixel_scale=pixel_scale)
+                client = create_client(new_choice, pixel_scale=pixel_scale, use_move_now=client.use_move_now)
                 client.sync_screen(screen_w, screen_h)
                 print(f"[+] Бэкенд изменён на: {client.backend_name}")
             elif choice == "11":
-                run_pattern_min_jerk_step(client, pacer, delta_px=250.0, duration_ms=250.0, axis="x", pixel_scale=pixel_scale)
+                client.use_move_now = not client.use_move_now
+                mode_str = "m.move_now (прямой 1-мс репорт, обход очереди)" if client.use_move_now else "0x18 MOVE (стандартный опкод, очередь 8мс)"
+                print(f"\n[+] Режим команды изменён на: {mode_str}")
             elif choice == "12":
+                print(f"\n--- НАСТРОЙКА АППАРАТНОГО СГЛАЖИВАНИЯ / СЛИЯНИЯ ВЕКТОРОВ (MOUSE SPREAD) ---")
+                print(f"Текущее значение на плате: {spread_str}")
+                print("Справка по режимам:")
+                print("  0%  — сглаживание отключено (0 мс lag, но раздельные пакеты вызывают Bursts при движении рукой)")
+                print("  5%  — мягкое слияние векторов (~1-2 мс окно, устраняет Bursts без блокировки мыши!) [РЕКОМЕНДУЕТСЯ]")
+                print("  10% — среднее слияние (~3-4 мс окно)")
+                print("  50% — старый заводской фильтр MAKCU (17 мс, устаревший)")
+                val_str = input("Введите новый процент (0-100, Enter для отмены): ").strip()
+                if val_str.isdigit():
+                    new_val = int(val_str)
+                    save_choice = input("Сохранить перманентно в NOR-flash платы? (y/n, Enter=n): ").strip().lower() == "y"
+                    ok, msg = set_device_mouse_spread(new_val, save_to_nor=save_choice)
+                    print(f"[{'+' if ok else '-'}] {msg}")
+                    if ok:
+                        current_spread = new_val
+            elif choice == "13":
+                run_pattern_min_jerk_step(client, pacer, delta_px=250.0, duration_ms=250.0, axis="x", pixel_scale=pixel_scale)
+            elif choice == "14":
                 import subprocess
                 canvas_script = Path(__file__).parent / "mouse_trajectory_canvas.py"
                 print(f"\n[*] Запуск визуализатора полотна: {canvas_script}...")
