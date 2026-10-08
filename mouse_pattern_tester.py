@@ -1,15 +1,13 @@
 """
 MAKCU UDP Mouse Pattern Tester — Профессиональный калиброванный движок
-(Версия с защитой от переполнения очереди, Q16 квантованием и 500/1000 Гц)
+(Интеграция ABCurves Global Renderer + mak-suite UDP RAW Driver)
 
 Особенности:
 1. Защита от переполнения буферов ESP32 (Anti-Burst & Zero-Suppression).
-2. Выбор рабочей частоты:
-   - 500 Гц (Интервал 2.0 мс) — РЕКОМЕНДУЕМЫЙ Sweet Spot: нулевые потери, идеальная плавность.
-   - 1000 Гц (Интервал 1.0 мс) — нативный режим высокой частоты.
-3. Проверка границ экрана: предупреждает о риске упора в край экрана (Y=2159) на 4K.
-4. Прецизионный Q16 дельта-аккумулятор для кругов и синусоид: 100% точность замкнутости.
-5. Профиль Flash & Hogan Minimum Jerk для перемещений A->B (исключает «вялый старт»).
+2. Выбор рабочей частоты (500 Гц Sweet Spot / 1000 Гц нативный режим).
+3. Проверка границ экрана на 4K.
+4. Нативный C-рантайм ABCurves Global Renderer (renderer_global_h80.bin).
+5. Аппаратный транспорт mak-suite (m.move_now + live управление mouse_spread).
 """
 
 from __future__ import annotations
@@ -296,7 +294,7 @@ class MakcuRawClient:
 
 
 class MakcuAbcurvesClient:
-    backend_name = "ABCurves SubStepper (Q16 + 500/1000 Гц)"
+    backend_name = "ABCurves Global Renderer + mak-suite (UDP RAW)"
 
     def __init__(self, ip: str = TARGET_IP, port: int = PORT, pixel_scale: float = 4.35, use_move_now: bool = True):
         self.target = (ip, port)
@@ -352,7 +350,15 @@ class MakcuAbcurvesClient:
 # Выполнение паттернов
 # ---------------------------------------------------------------------------
 
-def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str = "x", amplitude_px: float = 250.0, period_sec: float = 1.6, pixel_scale: float = 2.17):
+def run_pattern_line(
+    client,
+    pacer: RatePacer,
+    duration: float = 12.0,
+    axis: str = "x",
+    amplitude_px: float = 250.0,
+    period_sec: float = 1.6,
+    pixel_scale: float = 2.17,
+):
     check_screen_margin(amplitude_px + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
     counts_amplitude = amplitude_px * pixel_scale
@@ -363,7 +369,6 @@ def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str
 
     hz = pacer.target_hz
     dt = 1.0 / hz
-    ramp_time = 0.4
     omega = (2.0 * math.pi) / period_sec
 
     last_val = 0.0
@@ -376,18 +381,7 @@ def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str
         while time.perf_counter() < end_time:
             tick += 1
             t = tick * dt
-
-            # Плавный рамп амплитуды для исключения стартового рывка
-            if t < ramp_time:
-                tau = t / ramp_time
-                amp = counts_amplitude * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            elif duration < 99999 and t > (duration - ramp_time):
-                tau = (duration - t) / ramp_time
-                amp = counts_amplitude * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            else:
-                amp = counts_amplitude
-
-            curr_val = amp * math.sin(omega * t)
+            curr_val = counts_amplitude * math.sin(omega * t)
 
             if hasattr(client, "step_smooth"):
                 smooth_delta = curr_val - last_val
@@ -416,7 +410,14 @@ def run_pattern_line(client, pacer: RatePacer, duration: float = 12.0, axis: str
         recorder.save_and_analyze(amplitude_px)
 
 
-def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_px: float = 250.0, period_sec: float = 2.0, pixel_scale: float = 2.17):
+def run_pattern_circle(
+    client,
+    pacer: RatePacer,
+    duration: float = 15.0,
+    radius_px: float = 250.0,
+    period_sec: float = 2.0,
+    pixel_scale: float = 2.17,
+):
     check_screen_margin(radius_px + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
     counts_radius = radius_px * pixel_scale
@@ -426,10 +427,9 @@ def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_
 
     hz = pacer.target_hz
     dt = 1.0 / hz
-    ramp_time = 0.5  # Мягкий спиральный вход (исключает стартовый бросок)
     omega = (2.0 * math.pi) / period_sec
 
-    last_x = 0.0
+    last_x = counts_radius
     last_y = 0.0
 
     start_time = time.perf_counter()
@@ -442,20 +442,9 @@ def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_
             tick += 1
             t = tick * dt
 
-            # Мягкий рамп радиуса (спиральный вход из (0,0) в орбиту)
-            if t < ramp_time:
-                tau = t / ramp_time
-                r = counts_radius * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            elif duration < 99999 and t > (duration - ramp_time):
-                tau = (duration - t) / ramp_time
-                r = counts_radius * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            else:
-                r = counts_radius
-
-            # Центрированная симметричная орбита: X в [-R, +R], Y в [-R, +R]
             theta = omega * t
-            curr_x = r * math.cos(theta)
-            curr_y = r * math.sin(theta)
+            curr_x = counts_radius * math.cos(theta)
+            curr_y = counts_radius * math.sin(theta)
 
             if hasattr(client, "step_smooth"):
                 smooth_dx = curr_x - last_x
@@ -483,7 +472,14 @@ def run_pattern_circle(client, pacer: RatePacer, duration: float = 15.0, radius_
         recorder.save_and_analyze(radius_px)
 
 
-def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale_px: float = 220.0, period_sec: float = 2.2, pixel_scale: float = 2.17):
+def run_pattern_infinity(
+    client,
+    pacer: RatePacer,
+    duration: float = 15.0,
+    scale_px: float = 220.0,
+    period_sec: float = 2.2,
+    pixel_scale: float = 2.17,
+):
     check_screen_margin(scale_px + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
     counts_scale = scale_px * pixel_scale
@@ -493,7 +489,6 @@ def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale
 
     hz = pacer.target_hz
     dt = 1.0 / hz
-    ramp_time = 0.5
     omega = (2.0 * math.pi) / period_sec
 
     last_x = 0.0
@@ -509,19 +504,10 @@ def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale
             tick += 1
             t = tick * dt
 
-            if t < ramp_time:
-                tau = t / ramp_time
-                sc = counts_scale * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            elif duration < 99999 and t > (duration - ramp_time):
-                tau = (duration - t) / ramp_time
-                sc = counts_scale * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            else:
-                sc = counts_scale
-
             t_param = omega * t
             denom = 1.0 + math.sin(t_param) ** 2
-            curr_x = sc * math.cos(t_param) / denom
-            curr_y = sc * math.sin(t_param) * math.cos(t_param) / denom
+            curr_x = counts_scale * math.cos(t_param) / denom
+            curr_y = counts_scale * math.sin(t_param) * math.cos(t_param) / denom
 
             if hasattr(client, "step_smooth"):
                 smooth_dx = curr_x - last_x
@@ -549,7 +535,7 @@ def run_pattern_infinity(client, pacer: RatePacer, duration: float = 15.0, scale
         recorder.save_and_analyze(scale_px)
 
 
-def run_pattern_min_jerk_step(
+def run_pattern_step(
     client,
     pacer: RatePacer,
     delta_px: float = 250.0,
@@ -559,20 +545,36 @@ def run_pattern_min_jerk_step(
 ):
     check_screen_margin(abs(delta_px) + 50.0)
     recorder = FlightRecorder(LOG_FILENAME)
-    title = f"ПРЯМОЙ ШАГ MINIMUM JERK {delta_px:+.0f} px по {axis.upper()}"
-    print(f"\n[>] Запущен режим: {title} (Длительность: {duration_ms:.0f} мс)")
+    title = f"ПРЯМОЙ ШАГ {delta_px:+.0f} px по {axis.upper()}"
+    print(f"\n[>] Запущен режим: {title} (Длительность: {duration_ms:.0f} мс, Частота: {pacer.target_hz:.0f} Гц)")
     print("   [REC] Идёт запись в лог...\n")
 
     dx_px = delta_px if axis == "x" else 0.0
     dy_px = delta_px if axis == "y" else 0.0
 
     if hasattr(client, "substepper"):
-        steps = client.substepper.generate_steps(dx_px, dy_px, duration_ms=duration_ms, settling_ms=20)
+        steps = client.substepper.generate_steps(
+            dx_px,
+            dy_px,
+            duration_ms=duration_ms,
+            hz=pacer.target_hz,
+        )
     else:
+        from abcurves_substepper import Q16Accumulator
+
+        acc = Q16Accumulator()
         total_mickeys_x = dx_px * pixel_scale
         total_mickeys_y = dy_px * pixel_scale
-        n = max(5, int(duration_ms))
-        steps = [(int(round(total_mickeys_x / n)), int(round(total_mickeys_y / n)))] * n
+        ticks_per_ms = pacer.target_hz / 1000.0
+        n = max(5, int(round(duration_ms * ticks_per_ms)))
+        steps = []
+        slice_x = total_mickeys_x / n
+        slice_y = total_mickeys_y / n
+        for _ in range(n):
+            steps.append(acc.step(slice_x, slice_y))
+        rx, ry = acc.step(0.0, 0.0)
+        if rx != 0 or ry != 0:
+            steps.append((rx, ry))
 
     pacer.reset()
     for cmd_dx, cmd_dy in steps:
@@ -628,8 +630,8 @@ def main():
     print("   MAKCU UDP: КАЛИБРОВАННЫЙ ЭКРАННЫЙ ТЕСТЕР        ")
     print("===================================================")
     print(f"[*] Дисплей: {screen_w}x{screen_h} | Калибровочный масштаб: {pixel_scale:.2f}x")
-    print("1. ABCurves SubStepper (Q16 + 500/1000 Гц) [По умолчанию / РЕКОМЕНДУЕТСЯ]")
-    print("2. RAW UDP (чистые сокеты + Q16)")
+    print("1. ABCurves + mak-suite (Global Renderer H80 + UDP RAW) [По умолчанию / РЕКОМЕНДУЕТСЯ]")
+    print("2. Pure mak-suite (RAW UDP + Q16)")
     print("===================================================")
 
     init_backend = input("Выберите бэкенд (1 или 2, Enter=1): ").strip()
@@ -668,10 +670,10 @@ def main():
 7. БЕСКОНЕЧНЫЙ круг (для проверки движения собственной рукой)
 8. ИЗМЕНИТЬ ЧАСТОТУ (500 Гц [Sweet Spot] / 1000 Гц / 250 Гц)
 9. НАСТРОЙКА МАСШТАБА (Текущий: {pixel_scale:.2f}x)
-10. СМЕНИТЬ БЭКЕНД (ABCurves SubStepper <-> RAW UDP)
+10. СМЕНИТЬ БЭКЕНД (ABCurves + mak-suite <-> RAW UDP)
 11. ПЕРЕКЛЮЧИТЬ КОМАНДУ (m.move_now <-> 0x18 MOVE)
 12. НАСТРОЙКА MOUSE SPREAD (Текущий: {spread_str}) [Аппаратное слияние]
-13. ПРЯМОЙ ШАГ A->B (Flash & Hogan Minimum Jerk 250 px)
+13. ПРЯМОЙ ШАГ A->B (250 px через Global Renderer)
 14. ЗАПУСТИТЬ ВИЗУАЛИЗАТОР ПОЛОТНА (Экранный холст в реальном времени)
 0. Выход
 ===================================================
@@ -750,7 +752,7 @@ def main():
                     if ok:
                         current_spread = new_val
             elif choice == "13":
-                run_pattern_min_jerk_step(client, pacer, delta_px=250.0, duration_ms=250.0, axis="x", pixel_scale=pixel_scale)
+                run_pattern_step(client, pacer, delta_px=250.0, duration_ms=250.0, axis="x", pixel_scale=pixel_scale)
             elif choice == "14":
                 import subprocess
                 canvas_script = Path(__file__).parent / "mouse_trajectory_canvas.py"

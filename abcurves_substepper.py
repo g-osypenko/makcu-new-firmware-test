@@ -1,18 +1,14 @@
 """
-ABCurves SubStepper — Высокоточный субстеппер и квантователь движений мыши.
+ABCurves SubStepper — Нативный C-рантайм рендерер движений мыши.
 
 Архитектура:
-1. Q16 Fixed-Point Accumulator:
-   Математически точный дельта-аккумулятор с сохранением дробных долей (mickeys)
-   в фиксированной точке Q16. Предотвращает потерю субпиксельных приращений
-   и обеспечивает 100% замкнутость траекторий (круги, синусоиды, восьмёрки)
-   без затупов и срывов.
+1. ABCurves Global Renderer (renderer_global_h80.bin + abcurves_renderer.dll):
+   Нативная C-нейросеть GRU (34 362 обученных веса). Принимает непрерывные
+   смещения (dx, dy) и формирует естественные отчёты сенсора мыши с биомеханическим
+   квантованием и микродинамикой.
 
-2. ABCurves Neural Minimum-Jerk Reaching:
-   Для дискретных перемещений A->B (move_rel) используется нативная библиотека
-   ABCurves (abcurves_renderer.dll + renderer_global_h80.bin) с биологическим
-   профилем Flash & Hogan Minimum Jerk (10*t^3 - 15*t^4 + 6*t^5) и хвостовыми
-   settling-тиками для полного сброса долга Q16.
+2. Q16 Fixed-Point Fallback:
+   32-битный дельта-аккумулятор с сохранением остатков на случай резервного режима.
 """
 
 from __future__ import annotations
@@ -93,6 +89,7 @@ class ABCurvesSubStepper:
         self.neural_available = False
         self.model = None
         self.prepared_context = None
+        self.stream = None
 
         if _ABC_AVAILABLE:
             m_path = Path(model_path or self.DEFAULT_MODEL_PATH).resolve()
@@ -102,16 +99,28 @@ class ABCurvesSubStepper:
                     self.model = PortableRendererModel(m_path, library=d_path)
                     neutral_reports = np.zeros((CONTEXT_TICKS, 2), dtype=np.int16)
                     self.prepared_context = self.model.prepare_context(neutral_reports)
+                    self.stream = self.prepared_context.begin_stream(event_seed=self.default_seed)
                     self.neural_available = True
                 except Exception as e:
-                    print(f"[!] Предупреждение: ошибка инициализации нейромодели ABCurves: {e}")
+                    print(f"[!] Предупреждение: ошибка инициализации Global Renderer ABCurves: {e}")
 
     def reset(self) -> None:
-        """Сбрасывает внутренний аккумулятор погрешности."""
+        """Сбрасывает поток Global Renderer к начальному состоянию."""
+        if self.prepared_context is not None:
+            try:
+                self.stream = self.prepared_context.begin_stream(event_seed=self.default_seed)
+            except Exception:
+                pass
         self.accumulator.reset()
 
     def reset_stream(self, seed: int | None = None) -> None:
-        """Совместимый псевдоним reset."""
+        """Сбрасывает поток Global Renderer с новым seed."""
+        if self.prepared_context is not None:
+            s_val = self.default_seed if seed is None else int(seed)
+            try:
+                self.stream = self.prepared_context.begin_stream(event_seed=s_val)
+            except Exception:
+                pass
         self.accumulator.reset()
 
     def px_to_mickeys(self, px: float) -> float:
@@ -124,9 +133,14 @@ class ABCurvesSubStepper:
 
     def step(self, smooth_dx_mickeys: float, smooth_dy_mickeys: float) -> tuple[int, int]:
         """
-        Квантует одиночное непрерывное смещение через Q16 аккумулятор.
-        Гарантирует 100% сохранение дельт, полное отсутствие затупов и зависаний.
+        Рендерит непрерывное смещение через C-рантайм ABCurves Global Renderer (renderer_global_h80.bin).
         """
+        if self.stream is not None:
+            try:
+                report = self.stream.step([float(smooth_dx_mickeys), float(smooth_dy_mickeys)])
+                return int(report[0]), int(report[1])
+            except Exception:
+                pass
         return self.accumulator.step(smooth_dx_mickeys, smooth_dy_mickeys)
 
     def generate_steps(
@@ -134,63 +148,27 @@ class ABCurvesSubStepper:
         dx_px: float,
         dy_px: float,
         duration_ms: float = 200.0,
-        profile: str = "min_jerk",
-        settling_ms: int = 20,
-        seed: int | None = None,
+        hz: float = 1000.0,
+        **_kwargs,
     ) -> list[tuple[int, int]]:
         """
-        Генерирует последовательность 1-мс шагов для дискретного движения A->B.
-        Использует нейрорендерер ABCurves при наличии или прецизионный Q16 минимум-рывок.
+        Генерирует последовательность шагов для перемещения A->B через ABCurves Global Renderer.
         """
-        duration = max(5, int(round(duration_ms)))
-        settling = max(5, int(round(settling_ms)))
-        total_ticks = duration + settling
+        ticks_per_ms = float(hz) / 1000.0
+        duration = max(5, int(round(duration_ms * ticks_per_ms)))
 
         target_dx_mickeys = self.px_to_mickeys(dx_px)
         target_dy_mickeys = self.px_to_mickeys(dy_px)
 
         if duration == 0 or (abs(target_dx_mickeys) < 1e-5 and abs(target_dy_mickeys) < 1e-5):
-            return [(0, 0)] * total_ticks
+            return [(0, 0)] * duration
 
-        # Кинематика Flash & Hogan Minimum Jerk: s(t) = 10*t^3 - 15*t^4 + 6*t^5
-        t = np.linspace(0.0, 1.0, duration + 1)
-        if profile == "cosine":
-            s = 0.5 * (1.0 - np.cos(np.pi * t))
-        elif profile == "linear":
-            s = t
-        else:
-            # По умолчанию: Flash & Hogan Minimum Jerk (биологически плавный разгон и торможение)
-            s = 10.0 * (t ** 3) - 15.0 * (t ** 4) + 6.0 * (t ** 5)
+        step_x = target_dx_mickeys / duration
+        step_y = target_dy_mickeys / duration
 
-        ds = np.diff(s)  # Длина = duration, сумма sum(ds) == 1.0
-
-        # Если запрошен нейрорендерер и модель загружена:
-        if profile == "neural" and self.neural_available and self.prepared_context is not None:
-            smooth_motion = np.column_stack([
-                target_dx_mickeys * ds,
-                target_dy_mickeys * ds,
-            ])
-            smooth_settle = np.zeros((settling, 2), dtype=np.float32)
-            smooth_full = np.vstack([smooth_motion, smooth_settle]).astype(np.float32)
-            mask = np.ones(total_ticks, dtype=bool)
-            event_seed = self.default_seed if seed is None else int(seed)
-            try:
-                event = self.prepared_context.begin(smooth_full, mask, event_seed=event_seed)
-                reports_arr = event.render_remaining()
-                return [(int(r[0]), int(r[1])) for r in reports_arr]
-            except Exception:
-                pass
-
-        # Детерминированный высокоточный Q16 рендерер (без задержек, без затупов, 100% точность)
-        acc = Q16Accumulator()
         result = []
-        for i in range(duration):
-            rx, ry = acc.step(target_dx_mickeys * ds[i], target_dy_mickeys * ds[i])
-            result.append((rx, ry))
-
-        # Сброс остаточного долга аккумулятора в конце движения (если остался субмикро-остаток)
-        rx, ry = acc.step(0.0, 0.0)
-        if rx != 0 or ry != 0:
+        for _ in range(duration):
+            rx, ry = self.step(step_x, step_y)
             result.append((rx, ry))
 
         return result
@@ -201,44 +179,32 @@ class ABCurvesSubStepper:
         duration_s: float = 3.0,
         period_s: float = 2.0,
         hz: float = 500.0,
-        ramp_s: float = 0.5,
+        **_kwargs,
     ) -> list[tuple[int, int]]:
         """
-        Генерирует идеальные шаги для круговой траектории с плавным спиральным входом и выходом.
-        Траектория центрирована относительно точки старта:
-        X: [-R, +R], Y: [-R, +R].
+        Генерирует чистые шаги для круговой траектории через ABCurves Global Renderer.
+        Траектория центрирована относительно точки старта: X: [-R, +R], Y: [-R, +R].
         """
         total_ticks = max(10, int(round(duration_s * hz)))
         radius_mickeys = self.px_to_mickeys(radius_px)
         dt = 1.0 / hz
-        ramp_time = min(ramp_s, duration_s / 3.0)
 
-        acc = Q16Accumulator()
         steps = []
-        last_x = 0.0
+        last_x = radius_mickeys
         last_y = 0.0
 
         for tick in range(1, total_ticks + 1):
             t = tick * dt
-            if t < ramp_time:
-                tau = t / ramp_time
-                r = radius_mickeys * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            elif t > (duration_s - ramp_time):
-                tau = (duration_s - t) / ramp_time
-                r = radius_mickeys * (10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
-            else:
-                r = radius_mickeys
-
             theta = (2.0 * math.pi) * (t / period_s)
-            curr_x = r * math.cos(theta)
-            curr_y = r * math.sin(theta)
+            curr_x = radius_mickeys * math.cos(theta)
+            curr_y = radius_mickeys * math.sin(theta)
 
             dx = curr_x - last_x
             dy = curr_y - last_y
             last_x = curr_x
             last_y = curr_y
 
-            rx, ry = acc.step(dx, dy)
+            rx, ry = self.step(dx, dy)
             steps.append((rx, ry))
 
         return steps
