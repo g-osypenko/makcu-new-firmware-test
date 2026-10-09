@@ -36,6 +36,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 if str(_CUR_DIR) not in sys.path:
     sys.path.insert(0, str(_CUR_DIR))
+_MAK_SUITE_PATH = _REPO_ROOT / "mak-suite" / "python"
+if str(_MAK_SUITE_PATH) not in sys.path:
+    sys.path.insert(0, str(_MAK_SUITE_PATH))
 
 try:
     from basics.makcu_human_driver import MakcuHumanDriver
@@ -162,6 +165,53 @@ def make_move_now_packet(dx: int, dy: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Настройки платы MAKCU (NOR Flash / Live Tuning через makxd)
+# ---------------------------------------------------------------------------
+def get_device_mouse_spread(ip: str = TARGET[0], port: int = TARGET[1]) -> Optional[int]:
+    """Считывает текущее значение mouse_spread_percent из NOR Flash платы MAKCU."""
+    try:
+        from makxd import ConnectionConfig, create_controller, UdpWireMode
+        cfg = ConnectionConfig.udp(host=ip, port=port, mode=UdpWireMode.RAW)
+        dev = create_controller(connection=cfg)
+        try:
+            snap = dev.settings.read()
+            return int(snap.settings.mouse_spread_percent)
+        finally:
+            dev.disconnect()
+    except Exception:
+        return None
+
+
+def set_device_mouse_spread(
+    percent: int,
+    ip: str = TARGET[0],
+    port: int = TARGET[1],
+    save_to_nor: bool = True,
+) -> tuple[bool, str, int]:
+    """
+    Применяет mouse_spread_percent на плате (live) и сохраняет в NOR Flash.
+    0% = сплайн отключен (0 мс задержка, прямая выдача в USB HID).
+    """
+    try:
+        from makxd import ConnectionConfig, create_controller, UdpWireMode, SettingsSection
+        cfg = ConnectionConfig.udp(host=ip, port=port, mode=UdpWireMode.RAW)
+        dev = create_controller(connection=cfg)
+        try:
+            snap = dev.settings.read()
+            target_val = max(0, min(100, int(percent)))
+            snap.settings.mouse_spread_percent = target_val
+            snap = dev.settings.apply(snap, SettingsSection.MOUSE)
+            if save_to_nor:
+                dev.settings.save(snap, SettingsSection.MOUSE)
+                return True, f"Успешно применено и сохранено в NOR Flash: {snap.settings.mouse_spread_percent}%", snap.settings.mouse_spread_percent
+            return True, f"Успешно применено live: {snap.settings.mouse_spread_percent}%", snap.settings.mouse_spread_percent
+        finally:
+            dev.disconnect()
+    except Exception as e:
+        return False, f"Ошибка записи mouse_spread: {e}", -1
+
+
+# ---------------------------------------------------------------------------
 # Precision Benchmark GUI Window
 # ---------------------------------------------------------------------------
 class BenchmarkApp:
@@ -179,11 +229,18 @@ class BenchmarkApp:
         # Боевой драйвер мыши MAKCU V4 с нейросетью ABCurves H80
         self.driver = MakcuHumanDriver(ip=TARGET[0], port=TARGET[1])
 
+        # Аппаратный фильтр mouse_spread на ESP32-S3
+        self.current_spread: Optional[int] = None
+        self.btn_spread_hwnd = None
+
         # Создаем окно
         self.ready_event = threading.Event()
         self.ui_thread = threading.Thread(target=self._run_ui, daemon=True)
         self.ui_thread.start()
         self.ready_event.wait(timeout=3.0)
+
+        # Асинхронное чтение текущего mouse_spread с платы
+        threading.Thread(target=self._init_spread_state, daemon=True).start()
 
     def log(self, text: str = ""):
         print(text)
@@ -243,8 +300,8 @@ class BenchmarkApp:
             if cmd_id == 200 or lparam == self.edit_hwnd:
                 return 0
             notify_code = (wparam >> 16) & 0xFFFF
-            # Обрабатываем только нажатия кнопок (BN_CLICKED == 0) в диапазоне 100..112
-            if notify_code == 0 and (100 <= cmd_id <= 112):
+            # Обрабатываем только нажатия кнопок (BN_CLICKED == 0) в диапазоне 100..115
+            if notify_code == 0 and (100 <= cmd_id <= 115):
                 self._on_action(cmd_id)
             return 0
 
@@ -261,6 +318,7 @@ class BenchmarkApp:
             elif vk == ord('8'): self._on_action(108)
             elif vk == ord('9'): self._on_action(109)
             elif vk == ord('0'): self._on_action(112)
+            elif vk == ord('S'): self._on_action(113)
             elif vk == ord('C'): self.clear_log()
             elif vk == 27:  # Esc
                 user32.PostMessageW(hwnd, 0x0010, 0, 0)
@@ -287,12 +345,12 @@ class BenchmarkApp:
         wc.lpszClassName = f"MakcuBenchWin_{secrets.token_hex(4)}"
         user32.RegisterClassExW(ctypes.byref(wc))
 
-        # Главное окно (960 x 640)
+        # Главное окно (960 x 680)
         self.hwnd = user32.CreateWindowExW(
             0x00000008,  # WS_EX_TOPMOST
             wc.lpszClassName, 'MAKCU V4 - Precision Raw Input Benchmark (1000 Hz GUI)',
             0x00CF0000 | 0x10000000,  # WS_OVERLAPPEDWINDOW | WS_VISIBLE
-            100, 80, 960, 640, None, None, wc.hInstance, None
+            100, 60, 960, 680, None, None, wc.hInstance, None
         )
 
         # Регистрация честного FOREGROUND Raw Input (dwFlags = 0)
@@ -319,6 +377,7 @@ class BenchmarkApp:
             (108, "[8] Драйвер: move(+150, +75) [Диагональ]"),
             (109, "[9] Драйвер: Флик (+200, -100) + Выстрел"),
             (112, "[0] Драйвер: Быстрый круг 5 сек (1000 Гц)"),
+            (113, "[S] mouse_spread: ... (Чтение)"),
             (110, "[C] Очистить лог"),
             (111, "[Esc] Выход"),
         ]
@@ -332,6 +391,8 @@ class BenchmarkApp:
                 self.hwnd, ctypes.cast(b_id, wintypes.HMENU), wc.hInstance, None
             )
             user32.SendMessageW(btn_hwnd, 0x0030, font_gui, 1)  # WM_SETFONT
+            if b_id == 113:
+                self.btn_spread_hwnd = btn_hwnd
             btn_y += 39
 
         # Журнал результатов справа (Edit multiline readonly)
@@ -339,7 +400,7 @@ class BenchmarkApp:
             0x00000200,  # WS_EX_CLIENTEDGE
             'EDIT', '',
             0x50200844 | 0x00800000,  # WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_BORDER
-            350, 10, 575, 570,
+            350, 10, 575, 615,
             self.hwnd, ctypes.cast(200, wintypes.HMENU), wc.hInstance, None
         )
         user32.SendMessageW(self.edit_hwnd, 0x0030, font_mono, 1)
@@ -356,7 +417,8 @@ class BenchmarkApp:
         self.log("[+] Окно активно. Фоновый троттлинг Windows 11 отключен.")
         self.log("[+] Кнопки [1]..[5]: Аппаратные стресс-тесты шины MAKCU")
         self.log("[+] Кнопки [6]..[9], [0]: Готовый Human Driver (ABCurves H80 1000 Гц)")
-        self.log("[+] Кликайте по кнопкам слева или жмите клавиши (P, 1..9, 0, C, Esc).")
+        self.log("[+] Кнопка  [S]: Переключение mouse_spread (0% сплайн выкл / 5% / 50%)")
+        self.log("[+] Кликайте по кнопкам слева или жмите клавиши (P, 1..9, 0, S, C, Esc).")
         self.log("=" * 65)
 
         msg = wintypes.MSG()
@@ -368,7 +430,7 @@ class BenchmarkApp:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def _on_action(self, cmd_id: int):
-        if cmd_id not in (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112):
+        if cmd_id not in (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113):
             return
         if cmd_id == 110:
             self.clear_log()
@@ -410,10 +472,81 @@ class BenchmarkApp:
                 self._run_driver_flick_and_shot(200.0, -100.0)
             elif cmd_id == 112:
                 self._run_driver_circle(duration_s=5.0, radius=180.0, revs_per_sec=2.5)
+            elif cmd_id == 113:
+                self._toggle_mouse_spread()
         finally:
             self.test_busy = False
             if self.hwnd:
                 user32.SetWindowTextW(self.hwnd, "MAKCU V4 - Precision Raw Input Benchmark (1000 Hz GUI)")
+
+    def _get_spread_btn_text(self, val: Optional[int]) -> str:
+        if val is None:
+            return "[S] mouse_spread: ? (Чтение...)"
+        if val == 0:
+            return "[S] mouse_spread: 0% (Сплайн ВЫКЛ)"
+        if val == 5:
+            return "[S] mouse_spread: 5% (Мягкое 2мс)"
+        if val == 50:
+            return "[S] mouse_spread: 50% (Заводское 17мс)"
+        return f"[S] mouse_spread: {val}%"
+
+    def _init_spread_state(self):
+        time.sleep(0.3)
+        val = get_device_mouse_spread(TARGET[0], TARGET[1])
+        self.current_spread = val
+        if self.btn_spread_hwnd and val is not None:
+            user32.SetWindowTextW(self.btn_spread_hwnd, self._get_spread_btn_text(val))
+        if val is not None:
+            if val == 0:
+                self.log(f"[+] Аппаратный mouse_spread: 0% [Сплайн ВЫКЛ, 0 мс лаг, прямая выдача]")
+            else:
+                self.log(f"[!] Аппаратный mouse_spread: {val}% [Сплайн ВКЛ, задержка до 17 мс! Нажмите [S] для 0%]")
+        else:
+            self.log("[-] Не удалось получить mouse_spread с платы (проверьте сеть).")
+
+    def _toggle_mouse_spread(self):
+        self.log("\n" + "=" * 65)
+        self.log(" НАСТРОЙКА ПЛАТЫ: mouse_spread (Аппаратное слияние / Сплайн)")
+        self.log("=" * 65)
+        curr = self.current_spread
+        if curr is None:
+            self.log("[*] Чтение текущего состояния платы...")
+            curr = get_device_mouse_spread(TARGET[0], TARGET[1])
+            self.current_spread = curr
+
+        if curr == 0:
+            next_val = 5
+        elif curr == 5:
+            next_val = 50
+        elif curr == 50:
+            next_val = 0
+        else:
+            next_val = 0
+
+        modes = {
+            0: "0% (Сплайн ОТКЛЮЧЕН, 0 мс задержки, прямая выдача в USB HID)",
+            5: "5% (Мягкое слияние векторов ~1-2 мс)",
+            50: "50% (Старый заводской фильтр MAKCU, размазывание до 17 мс)",
+        }
+        desc = modes.get(next_val, f"{next_val}%")
+
+        self.log(f"[*] Смена значения: {curr if curr is not None else '?'}% -> {next_val}%")
+        self.log(f"[*] Режим: {desc}")
+        self.log("[*] Запись в NOR Flash памяти ESP32-S3...")
+
+        ok, msg, actual = set_device_mouse_spread(next_val, TARGET[0], TARGET[1], save_to_nor=True)
+        if ok:
+            self.current_spread = actual
+            if self.btn_spread_hwnd:
+                user32.SetWindowTextW(self.btn_spread_hwnd, self._get_spread_btn_text(actual))
+            self.log(f"[+] {msg}")
+            if actual == 0:
+                self.log("[+] РЕЗУЛЬТАТ: Аппаратный сплайн отключен. Отчеты идут 1:1 без сглаживания!")
+            else:
+                self.log(f"[+] РЕЗУЛЬТАТ: Установлен аппаратный фильтр слияния {actual}%.")
+        else:
+            self.log(f"[-] {msg}")
+        self.log("=" * 65)
 
     def _log_timing_stats(self, dts: list[float], rec_count: int, elapsed_s: Optional[float] = None):
         """Единый стандарт вывода USB HID таймингов для всех тестов."""
