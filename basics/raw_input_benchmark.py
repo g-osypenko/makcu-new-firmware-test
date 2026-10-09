@@ -2,8 +2,9 @@
 """
 ПРЕЦИЗИОННЫЙ RAW INPUT GUI БЕНЧМАРК MAKCU V4 (1000 ГЦ НАПРЯМУЮ ИЗ ОКНА).
 
-Все тесты запускаются прямо кнопками в окне или горячими клавишами (P, 1..9, C, Esc).
-Окно всегда активно (Foreground), что полностью исключает фоновый троттлинг Windows 11 (125 Гц)!
+Все тесты запускаются прямо кнопками в окне или горячими клавишами (P, 1..9, 0, S, C, Esc).
+Поддерживаются глобальные горячие клавиши и фоновый захват мыши (RIDEV_INPUTSINK),
+что позволяет запускать тесты клавишами, пока активно другое окно (например, Google Chrome с тестером полинга).
 """
 
 import ctypes
@@ -41,9 +42,9 @@ if str(_MAK_SUITE_PATH) not in sys.path:
     sys.path.insert(0, str(_MAK_SUITE_PATH))
 
 try:
-    from basics.makcu_human_driver import MakcuHumanDriver
+    from basics.makcu_human_driver import MakcuHumanDriver, enable_combat_mode
 except ImportError:
-    from makcu_human_driver import MakcuHumanDriver
+    from makcu_human_driver import MakcuHumanDriver, enable_combat_mode
 
 # ---------------------------------------------------------------------------
 # Win32 x64 ABI Signatures
@@ -77,6 +78,12 @@ user32.SendMessageW.restype = ctypes.c_longlong
 
 user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
 user32.SetWindowTextW.restype = wintypes.BOOL
+
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
 
 gdi32.CreateFontW.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -228,10 +235,12 @@ class BenchmarkApp:
 
         # Боевой драйвер мыши MAKCU V4 с нейросетью ABCurves H80
         self.driver = MakcuHumanDriver(ip=TARGET[0], port=TARGET[1])
+        self.combat_status = getattr(self.driver, "combat_status", {})
 
         # Аппаратный фильтр mouse_spread на ESP32-S3
         self.current_spread: Optional[int] = None
         self.btn_spread_hwnd = None
+        self.registered_hotkeys: list[int] = []
 
         # Создаем окно
         self.ready_event = threading.Event()
@@ -305,7 +314,23 @@ class BenchmarkApp:
                 self._on_action(cmd_id)
             return 0
 
-        elif msg == 0x0100:  # WM_KEYDOWN (горячие клавиши)
+        elif msg == 0x0312:  # WM_HOTKEY (глобальные горячие клавиши, когда активно другое окно)
+            hk_id = int(wparam)
+            if hk_id in (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 112, 113, 114):
+                self._on_action(hk_id)
+            elif hk_id == 115:                 # Хоткей 'K' -> режим хаоса 114
+                self._on_action(114)
+            elif 201 <= hk_id <= 209:
+                self._on_action(hk_id - 100)  # Numpad 1..9 -> cmd 101..109
+            elif hk_id == 212:
+                self._on_action(112)          # Numpad 0 -> cmd 112
+            elif hk_id == 214:                 # Numpad * -> режим хаоса 114
+                self._on_action(114)
+            elif hk_id == 110:
+                self.clear_log()
+            return 0
+
+        elif msg == 0x0100:  # WM_KEYDOWN (горячие клавиши при фокусе в окне)
             vk = wparam
             if vk == ord('P'): self._on_action(100)
             elif vk == ord('1'): self._on_action(101)
@@ -318,6 +343,7 @@ class BenchmarkApp:
             elif vk == ord('8'): self._on_action(108)
             elif vk == ord('9'): self._on_action(109)
             elif vk == ord('0'): self._on_action(112)
+            elif vk in (ord('W'), ord('K')): self._on_action(114)
             elif vk == ord('S'): self._on_action(113)
             elif vk == ord('C'): self.clear_log()
             elif vk == 27:  # Esc
@@ -330,10 +356,20 @@ class BenchmarkApp:
             return 0
 
         elif msg == 0x0002:  # WM_DESTROY
+            self._unregister_hotkeys()
             user32.PostQuitMessage(0)
             return 0
 
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _unregister_hotkeys(self):
+        if self.hwnd:
+            for hk_id in self.registered_hotkeys:
+                try:
+                    user32.UnregisterHotKey(self.hwnd, hk_id)
+                except Exception:
+                    pass
+        self.registered_hotkeys.clear()
 
     def _run_ui(self):
         self.wnd_proc_cb = WNDPROC(self._wnd_proc)
@@ -353,13 +389,31 @@ class BenchmarkApp:
             100, 60, 960, 680, None, None, wc.hInstance, None
         )
 
-        # Регистрация честного FOREGROUND Raw Input (dwFlags = 0)
+        # Фоновый перехват мыши (RIDEV_INPUTSINK) - собирает отчеты даже когда фокус в Chrome
+        RIDEV_INPUTSINK = 0x00000100
         rid = RAWINPUTDEVICE()
         rid.usUsagePage = 0x01
         rid.usUsage = 0x02
-        rid.dwFlags = 0x00000000
+        rid.dwFlags = RIDEV_INPUTSINK
         rid.hwndTarget = self.hwnd
         user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
+
+        # Глобальные горячие клавиши (работают когда активно другое окно, например Google Chrome)
+        MOD_NOREPEAT = 0x4000
+        hotkey_bindings = [
+            (100, ord('P')),
+            (101, ord('1')), (102, ord('2')), (103, ord('3')), (104, ord('4')), (105, ord('5')),
+            (106, ord('6')), (107, ord('7')), (108, ord('8')), (109, ord('9')), (112, ord('0')),
+            (114, ord('W')), (115, ord('K')),
+            (113, ord('S')), (110, ord('C')),
+            # Numpad (удобно при тестировании в стороннем окне)
+            (201, 0x61), (202, 0x62), (203, 0x63), (204, 0x64), (205, 0x65),
+            (206, 0x66), (207, 0x67), (208, 0x68), (209, 0x69), (212, 0x60),
+            (214, 0x6A), # Numpad * -> режим хаоса
+        ]
+        for hk_id, vk in hotkey_bindings:
+            if user32.RegisterHotKey(self.hwnd, hk_id, MOD_NOREPEAT, vk):
+                self.registered_hotkeys.append(hk_id)
 
         font_gui = gdi32.CreateFontW(15, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
         font_mono = gdi32.CreateFontW(15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Consolas")
@@ -376,7 +430,8 @@ class BenchmarkApp:
             (107, "[7] Драйвер: move(+300, 0) [Фикс 200 мс]"),
             (108, "[8] Драйвер: move(+150, +75) [Диагональ]"),
             (109, "[9] Драйвер: Флик (+200, -100) + Выстрел"),
-            (112, "[0] Драйвер: Быстрый круг 5 сек (1000 Гц)"),
+            (112, "[0] Драйвер: Быстрый круг 5 сек (125 Гц)"),
+            (114, "[W] Широкий хаос 5 сек (Keymap Labs)"),
             (113, "[S] mouse_spread: ... (Чтение)"),
             (110, "[C] Очистить лог"),
             (111, "[Esc] Выход"),
@@ -414,11 +469,21 @@ class BenchmarkApp:
         self.log("=" * 65)
         self.log(" MAKCU V4 - 1000 HZ PRECISION RAW INPUT BENCHMARK")
         self.log("=" * 65)
-        self.log("[+] Окно активно. Фоновый троттлинг Windows 11 отключен.")
-        self.log("[+] Кнопки [1]..[5]: Аппаратные стресс-тесты шины MAKCU")
-        self.log("[+] Кнопки [6]..[9], [0]: Готовый Human Driver (ABCurves H80 1000 Гц)")
-        self.log("[+] Кнопка  [S]: Переключение mouse_spread (0% сплайн выкл / 5% / 50%)")
-        self.log("[+] Кликайте по кнопкам слева или жмите клавиши (P, 1..9, 0, S, C, Esc).")
+        self.log("[+] Боевой режим Windows (Combat Mode) АКТИВИРОВАН:")
+        c_prio = self.combat_status.get('high_priority', False)
+        c_eco = self.combat_status.get('ecoqos_disabled', False)
+        c_mmcss = self.combat_status.get('mmcss_games', False)
+        self.log(f"    MMCSS: {c_mmcss} | High Priority: {c_prio} | EcoQoS Off: {c_eco}")
+        self.log("[+] Фоновый перехват (RIDEV_INPUTSINK) и глобальные горячие клавиши активны!")
+        self.log("[+] Можно открыть Chrome (тестер полинга) и запускать тесты прямо там:")
+        self.log("    [W] или [K] - ШИРОКИЙ ХАОС 5 СЕК (размашистый тест под Keymap Labs)")
+        self.log("    [7] / Numpad 7 - тест фиксированного времени 200 мс (100% точность)")
+        self.log("    [0] / Numpad 0 - быстрый круг 5 сек (125 Гц UDP / 500 Гц HID)")
+        self.log("    [P] - замер физической мыши (3 сек)")
+        self.log("    [1]..[5] или Numpad 1..5 - аппаратные стресс-тесты шины MAKCU")
+        self.log("    [6], [8], [9] - боевые движения Human Driver")
+        self.log("    [S] - смена mouse_spread (0% сплайн выкл / 5% / 50%)")
+        self.log("    [C] - очистка лога | [Esc] - выход")
         self.log("=" * 65)
 
         msg = wintypes.MSG()
@@ -430,7 +495,7 @@ class BenchmarkApp:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def _on_action(self, cmd_id: int):
-        if cmd_id not in (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113):
+        if cmd_id not in (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114):
             return
         if cmd_id == 110:
             self.clear_log()
@@ -447,6 +512,7 @@ class BenchmarkApp:
         threading.Thread(target=self._worker, args=(cmd_id,), daemon=True).start()
 
     def _worker(self, cmd_id: int):
+        enable_combat_mode()
         if self.hwnd:
             user32.SetWindowTextW(self.hwnd, "MAKCU V4 - [ТЕСТ ВЫПОЛНЯЕТСЯ...]")
         try:
@@ -472,6 +538,8 @@ class BenchmarkApp:
                 self._run_driver_flick_and_shot(200.0, -100.0)
             elif cmd_id == 112:
                 self._run_driver_circle(duration_s=5.0, radius=180.0, revs_per_sec=2.5)
+            elif cmd_id == 114:
+                self._run_driver_chaotic_sweep(duration_s=5.0, amplitude_x=450.0, amplitude_y=300.0)
             elif cmd_id == 113:
                 self._toggle_mouse_spread()
         finally:
@@ -641,14 +709,14 @@ class BenchmarkApp:
         self.log(f" ТЕСТ: {title}")
         dur_desc = f"{dur_ms:.0f} мс" if dur_ms is not None else "Авто (Фиттс)"
         self.log(f" Параметры: Вектор=({dx:+.0f}, {dy:+.0f}) mickeys, Тайминг={dur_desc}")
-        self.log(" Схема: ABCurves H80 (1000 Гц) -> 250 Гц UDP -> USB HID")
+        self.log(" Схема: ABCurves H80 (1000 Гц) -> 125 Гц UDP (FreeRTOS) -> 500 Гц USB HID")
         self.log("=" * 65)
 
         time.sleep(0.15)
         self.reset_reports()
 
         t_start = time.perf_counter()
-        meta = self.driver.move(dx, dy, duration_ms=dur_ms, blocking=True)
+        meta = self.driver.move(dx, dy, duration_ms=dur_ms, dt_frame=0.008, blocking=True)
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
         # Ожидаем завершения очереди USB
@@ -662,8 +730,8 @@ class BenchmarkApp:
         calc_dur = meta.get("duration_ms", 0.0)
         frames = meta.get("frames_sent", 0)
 
-        dt_f = meta.get("dt_frame", 0.004)
-        hz_net = int(round(1.0 / dt_f)) if dt_f > 0 else 250
+        dt_f = meta.get("dt_frame", 0.008)
+        hz_net = int(round(1.0 / dt_f)) if dt_f > 0 else 125
         self.log(f"[*] Сглаживание:              {mode_str}")
         self.log(f"[*] Тайминг движения:         {calc_dur:.0f} мс (факт {elapsed_ms:.1f} мс)")
         self.log(f"[*] Кадров отправлено по UDP: {frames} шт. (сетка {dt_f*1000:.1f} мс / {hz_net} Гц)")
@@ -683,7 +751,7 @@ class BenchmarkApp:
         self.log("\n" + "=" * 65)
         self.log(" ТЕСТ: Боевой флик + Выстрел (ЛКМ) + Возврат")
         self.log(f" Параметры: Флик=({dx:+.0f}, {dy:+.0f}) mickeys -> Клик (hold 45 мс) -> Возврат")
-        self.log(" Схема: ABCurves H80 (1000 Гц) -> 250 Гц UDP -> USB HID")
+        self.log(" Схема: ABCurves H80 (1000 Гц) -> 125 Гц UDP (FreeRTOS) -> 500 Гц USB HID")
         self.log("=" * 65)
 
         time.sleep(0.15)
@@ -691,7 +759,7 @@ class BenchmarkApp:
 
         self.log("[*] Шаг 1: Выполняем боевой флик на цель...")
         t0 = time.perf_counter()
-        meta = self.driver.move(dx, dy, blocking=True)
+        meta = self.driver.move(dx, dy, dt_frame=0.008, blocking=True)
         t_move = (time.perf_counter() - t0) * 1000.0
 
         self.log("[*] Шаг 2: Производим выстрел (аппаратный клик ЛКМ)...")
@@ -727,16 +795,16 @@ class BenchmarkApp:
         # Шаг 3: Возвращаем курсор на исходную позицию...
         self.log("[*] Шаг 3: Возвращаем курсор на исходную позицию...")
         time.sleep(0.3)
-        self.driver.move(-dx, -dy, duration_ms=200.0, blocking=True)
+        self.driver.move(-dx, -dy, duration_ms=200.0, dt_frame=0.008, blocking=True)
         self.log("[+] Мышь аккуратно возвращена в точку старта.")
         self.log("=" * 65)
 
     def _run_driver_circle(self, duration_s: float = 5.0, radius: float = 180.0, revs_per_sec: float = 2.5):
         self.log("\n" + "=" * 65)
         self.log(f" ТЕСТ: Быстрое круговое движение драйвера ({duration_s:.1f} сек)")
-        dt_target = 0.004
+        dt_target = 0.008
         hz_target = int(round(1.0 / dt_target))
-        self.log(f" Схема: ABCurves H80 (1000 Гц) -> {hz_target} Гц UDP (Cat5e) -> USB HID")
+        self.log(f" Схема: ABCurves H80 (1000 Гц) -> {hz_target} Гц UDP (FreeRTOS) -> 500 Гц USB HID")
         self.log("=" * 65)
 
         time.sleep(0.2)
@@ -773,12 +841,55 @@ class BenchmarkApp:
         self._log_timing_stats(dts, rec_count, elapsed_s)
         self.log("=" * 65)
 
+    def _run_driver_chaotic_sweep(self, duration_s: float = 5.0, amplitude_x: float = 450.0, amplitude_y: float = 300.0):
+        self.log("\n" + "=" * 65)
+        self.log(f" ТЕСТ: Широкие хаотичные движения драйвера ({duration_s:.1f} сек)")
+        self.log(f" Параметры: Размах=(±{amplitude_x:.0f} X, ±{amplitude_y:.0f} Y), Тайминг={duration_s*1000:.0f} мс")
+        self.log(" Назначение: Замер частоты опроса в Keymap Labs / MouseRateChecker")
+        self.log(" Схема: ABCurves H80 (1000 Гц) -> 125 Гц UDP (FreeRTOS) -> 500 Гц USB HID")
+        self.log("=" * 65)
+
+        time.sleep(0.2)
+        self.reset_reports()
+
+        self.log(f"[*] Драйвер выполняет непрерывный размашистый хаотичный поток {duration_s:.1f} сек...")
+        t_start = time.perf_counter()
+        meta = self.driver.chaotic_sweep(duration_s=duration_s, amplitude_x=amplitude_x, amplitude_y=amplitude_y, dt_frame=0.008, blocking=True)
+        elapsed_s = time.perf_counter() - t_start
+
+        # Ожидаем завершения очереди USB
+        time.sleep(0.2)
+
+        sum_x, sum_y, rec_count, dts, _ = self.get_captured_stats()
+        diff_x = sum_x
+        diff_y = sum_y
+
+        mode_str = "ABCurves H80 (Нейросеть GRU)" if meta.get("used_model") else "Q16 Накопитель"
+        dt_actual = meta.get("dt_frame", 0.008)
+        hz_actual = int(round(1.0 / dt_actual)) if dt_actual > 0 else 125
+
+        self.log(f"[*] Сглаживание:              {mode_str}")
+        self.log(f"[*] Тайминг движения:         {duration_s*1000:.0f} мс (факт {elapsed_s*1000:.1f} мс)")
+        self.log(f"[*] Кадров отправлено по UDP: {meta.get('frames_sent', 0)} шт. (сетка {dt_actual*1000:.1f} мс / {hz_actual} Гц)")
+        self.log(f"[*] Отправлено драйвером:     {meta.get('sent_x', 0):+4d} X, {meta.get('sent_y', 0):+4d} Y")
+        self.log(f"[+] Получено в Windows RAW:   {sum_x:+4d} X, {sum_y:+4d} Y ({rec_count} отчетов USB HID)")
+        self.log(f"[-] Дрейф курсора от старта:  dx={diff_x:+d} mickeys, dy={diff_y:+d} mickeys")
+
+        if abs(diff_x) <= 2 and abs(diff_y) <= 2:
+            self.log("[+] РЕЗУЛЬТАТ: 100.0% доставка, контур замкнут (0 ошибок)!")
+        else:
+            self.log(f"[!] РЕЗУЛЬТАТ: Дрейф курсора (dx={diff_x:+d}, dy={diff_y:+d})!")
+
+        self._log_timing_stats(dts, rec_count, elapsed_s)
+        self.log("=" * 65)
+
     def run(self):
         try:
             while self.running:
                 time.sleep(0.1)
         finally:
             self.running = False
+            self._unregister_hotkeys()
             self.sock.close()
             if hasattr(self, 'driver') and self.driver:
                 self.driver.close()

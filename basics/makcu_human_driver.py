@@ -15,6 +15,7 @@ MAKCU V4 HUMAN MOUSE DRIVER (1000 HZ NEURAL STREAM -> 125 HZ UDP AGGREGATOR)
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import math
 from pathlib import Path
 import secrets
@@ -25,12 +26,72 @@ import threading
 import time
 from typing import Optional
 
-# Windows High-Resolution Multimedia Timer (1.0 ms)
-if sys.platform == "win32":
+# ---------------------------------------------------------------------------
+# БОЕВОЙ РЕЖИМ WINDOWS 11 (COMBAT MODE: MMCSS, ECOQOS DISABLE, HIGH PRIORITY)
+# ---------------------------------------------------------------------------
+class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [
+        ('Version', wintypes.ULONG),
+        ('ControlMask', wintypes.ULONG),
+        ('StateMask', wintypes.ULONG),
+    ]
+
+def enable_combat_mode() -> dict:
+    """
+    Активирует боевой режим ОС Windows (Combat Mode):
+    1. timeBeginPeriod(1) - точность системных таймеров 1.0 мс.
+    2. SetPriorityClass(HIGH_PRIORITY_CLASS) - процесс получает приоритет реального времени.
+    3. Отключение Windows 11 Power Throttling (EcoQoS) - запрет на троттлинг таймеров и фонового окна.
+    4. SetThreadPriority(THREAD_PRIORITY_HIGHEST) - максимальный приоритет текущего потока.
+    5. MMCSS (Multimedia Class Scheduler Service: 'Games') - выделение квантов реального времени Windows.
+    """
+    if sys.platform != "win32":
+        return {}
+
+    status = {}
+    kernel32 = ctypes.windll.kernel32
     try:
         ctypes.windll.winmm.timeBeginPeriod(1)
+        status['timer_1ms'] = True
     except Exception:
-        pass
+        status['timer_1ms'] = False
+
+    try:
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+        status['high_priority'] = bool(kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080))
+    except Exception:
+        status['high_priority'] = False
+
+    try:
+        kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = wintypes.BOOL
+        status['thread_priority'] = bool(kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 2))
+    except Exception:
+        status['thread_priority'] = False
+
+    try:
+        state = PROCESS_POWER_THROTTLING_STATE()
+        state.Version = 1
+        state.ControlMask = 0x1 | 0x4  # EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION
+        state.StateMask = 0           # Отключение троттлинга
+        kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+        status['ecoqos_disabled'] = bool(kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), 4, ctypes.byref(state), ctypes.sizeof(state)))
+    except Exception:
+        status['ecoqos_disabled'] = False
+
+    try:
+        avrt = ctypes.windll.avrt
+        task_idx = wintypes.DWORD(0)
+        avrt.AvSetMmThreadCharacteristicsW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        avrt.AvSetMmThreadCharacteristicsW.restype = wintypes.HANDLE
+        h_mmcss = avrt.AvSetMmThreadCharacteristicsW("Games", ctypes.byref(task_idx))
+        status['mmcss_games'] = bool(h_mmcss)
+    except Exception:
+        status['mmcss_games'] = False
+
+    return status
 
 # Поиск и подключение ABCurves
 _ABC_ROOT = Path(__file__).resolve().parents[1] / "ABCurves"
@@ -61,6 +122,7 @@ class MakcuHumanDriver:
         self.target = (ip, int(port))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.lock = threading.Lock()
+        self.combat_status = enable_combat_mode()
 
         # Инициализация модели ABCurves
         self.model = None
@@ -126,7 +188,7 @@ class MakcuHumanDriver:
         target_dx: float,
         target_dy: float,
         duration_ms: Optional[float] = None,
-        dt_frame: float = 0.004,
+        dt_frame: float = 0.008,
         blocking: bool = True,
     ) -> dict:
         """
@@ -135,7 +197,7 @@ class MakcuHumanDriver:
         :param target_dx: Смещение по оси X (mickeys)
         :param target_dy: Смещение по оси Y (mickeys)
         :param duration_ms: Длительность движения в миллисекундах (если None, рассчитывается по закону Фиттса)
-        :param dt_frame: Шаг отправки UDP пакетов (0.004 = 250 Гц / 4 тика ABCurves, 0.002 = 500 Гц, 0.008 = 125 Гц)
+        :param dt_frame: Шаг отправки UDP пакетов (0.008 = 125 Гц под 8-мс FreeRTOS субстеппер ESP32)
         :param blocking: Если True, функция блокирует поток до завершения движения
         :return: Словарь с телеметрией отправки (кадры, отправленные mickeys, режим)
         """
@@ -164,7 +226,7 @@ class MakcuHumanDriver:
             t.start()
             return {"async": True, "target_dx": int(round(target_dx)), "target_dy": int(round(target_dy)), "duration_ms": duration_ms}
 
-    def _execute_movement(self, target_dx: float, target_dy: float, duration_ms: float, dt_frame: float = 0.004) -> dict:
+    def _execute_movement(self, target_dx: float, target_dy: float, duration_ms: float, dt_frame: float = 0.008) -> dict:
         """
         Внутренний исполнитель:
         Чистый инференс ABCurves H80 (1000 Гц тики) -> агрегация в кадры dt_frame с Lead Pre-buffering.
@@ -205,8 +267,10 @@ class MakcuHumanDriver:
                     if ax != 0 or ay != 0:
                         self.sock.sendto(self._make_move_pkt(ax, ay), self.target)
 
-                    # Lead Pre-buffering: держим 1 опережающий кадр в очереди ESP32
-                    target_t = t0 + (f - 1) * dt_frame
+                    target_t = t0 + f * dt_frame
+                    rem = target_t - time.perf_counter()
+                    if rem > 0.0015:
+                        time.sleep(rem - 0.001)
                     while time.perf_counter() < target_t:
                         pass
 
@@ -242,7 +306,10 @@ class MakcuHumanDriver:
                     if ax != 0 or ay != 0:
                         self.sock.sendto(self._make_move_pkt(ax, ay), self.target)
 
-                    target_t = t0 + (f - 1) * dt_frame
+                    target_t = t0 + f * dt_frame
+                    rem = target_t - time.perf_counter()
+                    if rem > 0.0015:
+                        time.sleep(rem - 0.001)
                     while time.perf_counter() < target_t:
                         pass
 
@@ -270,7 +337,7 @@ class MakcuHumanDriver:
         radius: float = 180.0,
         duration_s: float = 5.0,
         revs_per_sec: float = 2.5,
-        dt_frame: float = 0.004,
+        dt_frame: float = 0.008,
         blocking: bool = True,
     ) -> dict:
         """
@@ -279,7 +346,7 @@ class MakcuHumanDriver:
         :param radius: Радиус круга в микеях (по умолчанию 180)
         :param duration_s: Длительность вращения в секундах (по умолчанию 5.0)
         :param revs_per_sec: Скорость вращения (оборотов в секунду, по умолчанию 2.5)
-        :param dt_frame: Шаг UDP пакетов (0.004 = 250 Гц UDP / 4 тика ABCurves, 0.002 = 500 Гц, 0.008 = 125 Гц)
+        :param dt_frame: Шаг UDP пакетов (0.008 = 125 Гц под 8-мс FreeRTOS субстеппер ESP32)
         :param blocking: Блокирующий вызов
         :return: Словарь с телеметрией отправки
         """
@@ -354,8 +421,10 @@ class MakcuHumanDriver:
                     if ax != 0 or ay != 0:
                         self.sock.sendto(self._make_move_pkt(ax, ay), self.target)
 
-                    # Lead Pre-buffering: держим 1 опережающий кадр в очереди ESP32
-                    target_t = t0 + (f - 1) * dt_frame
+                    target_t = t0 + f * dt_frame
+                    rem = target_t - time.perf_counter()
+                    if rem > 0.0015:
+                        time.sleep(rem - 0.001)
                     while time.perf_counter() < target_t:
                         pass
 
@@ -382,7 +451,10 @@ class MakcuHumanDriver:
                     if ax != 0 or ay != 0:
                         self.sock.sendto(self._make_move_pkt(ax, ay), self.target)
 
-                    target_t = t0 + (f - 1) * dt_frame
+                    target_t = t0 + f * dt_frame
+                    rem = target_t - time.perf_counter()
+                    if rem > 0.0015:
+                        time.sleep(rem - 0.001)
                     while time.perf_counter() < target_t:
                         pass
 
@@ -399,6 +471,157 @@ class MakcuHumanDriver:
                 "radius": radius,
                 "duration_s": duration_s,
                 "revs_per_sec": actual_revs_per_sec,
+                "frames_sent": frames_sent,
+                "sent_x": sent_total_x,
+                "sent_y": sent_total_y,
+                "used_model": used_model,
+                "dt_frame": dt_frame,
+            }
+
+    def chaotic_sweep(
+        self,
+        duration_s: float = 5.0,
+        amplitude_x: float = 450.0,
+        amplitude_y: float = 300.0,
+        dt_frame: float = 0.008,
+        blocking: bool = True,
+    ) -> dict:
+        """
+        Широкие непрерывные хаотичные движения мыши (для тестирования частоты опроса в Keymap Labs, MouseRateChecker).
+        Генерирует высокоскоростной гармонический полином с замкнутым контуром (дрейф строго 0).
+
+        :param duration_s: Длительность в секундах (по умолчанию 5.0 с под тест Keymap Labs)
+        :param amplitude_x: Амплитуда размаха по оси X в микеях (по умолчанию 450)
+        :param amplitude_y: Амплитуда размаха по оси Y в микеях (по умолчанию 300)
+        :param dt_frame: Сетка UDP (0.008 = 125 Гц под FreeRTOS субстеппер ESP32)
+        :param blocking: Блокирующий вызов
+        :return: Словарь с телеметрией отправки
+        """
+        if blocking:
+            return self._execute_chaotic_sweep(duration_s, amplitude_x, amplitude_y, dt_frame)
+        else:
+            holder: dict = {}
+            t = threading.Thread(
+                target=lambda: holder.update(self._execute_chaotic_sweep(duration_s, amplitude_x, amplitude_y, dt_frame)),
+                daemon=True,
+            )
+            t.start()
+            return {"async": True, "duration_s": duration_s, "amplitude_x": amplitude_x, "amplitude_y": amplitude_y}
+
+    def _execute_chaotic_sweep(
+        self,
+        duration_s: float,
+        amplitude_x: float,
+        amplitude_y: float,
+        dt_frame: float,
+    ) -> dict:
+        """
+        Непрерывный высокоскоростной хаотичный поток для тестирования полинга.
+        Гармонический спектр с кратными модами гарантирует полное покрытие рабочей зоны
+        и абсолютно точный возврат в (0, 0) в конце движения.
+        """
+        with self.lock:
+            ticks_per_frame = max(1, int(round(dt_frame * 1000.0)))
+            total_frames = int(round(duration_s / dt_frame))
+            total_ticks = total_frames * ticks_per_frame
+
+            # Гармонические моды: целые числа полных циклов за время duration_s
+            kx1, kx2, kx3 = 6, 11, 17
+            ky1, ky2, ky3 = 7, 13, 19
+
+            sent_total_x = 0
+            sent_total_y = 0
+            frames_sent = 0
+            used_model = False
+
+            t0 = time.perf_counter()
+
+            if self.ctx is not None:
+                used_model = True
+                stream = self.ctx.begin_stream(event_seed=secrets.randbits(32))
+
+                tick_idx = 0
+                prev_ideal_x = 0.0
+                prev_ideal_y = 0.0
+
+                for f in range(1, total_frames + 1):
+                    ax, ay = 0, 0
+                    for _ in range(ticks_per_frame):
+                        tick_idx += 1
+                        tau = tick_idx / float(total_ticks)
+                        cur_x = amplitude_x * (0.60 * math.sin(2.0 * math.pi * kx1 * tau) +
+                                              0.30 * math.sin(2.0 * math.pi * kx2 * tau) +
+                                              0.10 * math.sin(2.0 * math.pi * kx3 * tau))
+                        cur_y = amplitude_y * (0.60 * math.sin(2.0 * math.pi * ky1 * tau) +
+                                              0.30 * math.sin(2.0 * math.pi * ky2 * tau) +
+                                              0.10 * math.sin(2.0 * math.pi * ky3 * tau))
+
+                        step_dx = cur_x - prev_ideal_x
+                        step_dy = cur_y - prev_ideal_y
+                        prev_ideal_x = cur_x
+                        prev_ideal_y = cur_y
+
+                        out = stream.step([step_dx, step_dy])
+                        ax += int(out[0])
+                        ay += int(out[1])
+
+                    sent_total_x += ax
+                    sent_total_y += ay
+                    frames_sent += 1
+
+                    if ax != 0 or ay != 0:
+                        self.sock.sendto(self._make_move_pkt(ax, ay), self.target)
+
+                    target_t = t0 + f * dt_frame
+                    rem = target_t - time.perf_counter()
+                    if rem > 0.0015:
+                        time.sleep(rem - 0.001)
+                    while time.perf_counter() < target_t:
+                        pass
+
+            else:
+                tick_idx = 0
+                for f in range(1, total_frames + 1):
+                    tick_idx += ticks_per_frame
+                    tau = tick_idx / float(total_ticks)
+                    cur_x = amplitude_x * (0.60 * math.sin(2.0 * math.pi * kx1 * tau) +
+                                          0.30 * math.sin(2.0 * math.pi * kx2 * tau) +
+                                          0.10 * math.sin(2.0 * math.pi * kx3 * tau))
+                    cur_y = amplitude_y * (0.60 * math.sin(2.0 * math.pi * ky1 * tau) +
+                                          0.30 * math.sin(2.0 * math.pi * ky2 * tau) +
+                                          0.10 * math.sin(2.0 * math.pi * ky3 * tau))
+
+                    cur_round_x = int(round(cur_x))
+                    cur_round_y = int(round(cur_y))
+                    ax = cur_round_x - sent_total_x
+                    ay = cur_round_y - sent_total_y
+
+                    sent_total_x += ax
+                    sent_total_y += ay
+                    frames_sent += 1
+
+                    if ax != 0 or ay != 0:
+                        self.sock.sendto(self._make_move_pkt(ax, ay), self.target)
+
+                    target_t = t0 + f * dt_frame
+                    rem = target_t - time.perf_counter()
+                    if rem > 0.0015:
+                        time.sleep(rem - 0.001)
+                    while time.perf_counter() < target_t:
+                        pass
+
+            rem_x = -sent_total_x
+            rem_y = -sent_total_y
+            if rem_x != 0 or rem_y != 0:
+                self.sock.sendto(self._make_move_pkt(rem_x, rem_y), self.target)
+                sent_total_x += rem_x
+                sent_total_y += rem_y
+                frames_sent += 1
+
+            return {
+                "duration_s": duration_s,
+                "amplitude_x": amplitude_x,
+                "amplitude_y": amplitude_y,
                 "frames_sent": frames_sent,
                 "sent_x": sent_total_x,
                 "sent_y": sent_total_y,
