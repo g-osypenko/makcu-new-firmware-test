@@ -1,0 +1,80 @@
+# Снимок настроек MAKCU, 2026-10-10 19:23, порт COM5, 4000000 бод
+
+## MAK_API (GET)
+- 0x02 DEVICE (kinds): 03
+- 0x04 FIRMWARE_VERSION: FE 0F 00 00 = 4094
+- 0x1F interpolation (255=AUTO): 00 = 0
+- 0x10 BUTTONS stream: 01
+- 0x2B KEY_KEYS stream: 00
+- 0x41 CONTROLLER_STREAM: 00
+- 0x52 INPUT_STREAM mouse: 01
+- 0x52 INPUT_STREAM keyboard: 00
+- 0x52 INPUT_STREAM controller: 00
+- 0x6A RAW_STATUS id=0 (metadata): 00 01 6E 6A 01 00 10 10 = schema 1, last_accepted_id 92782, свободно 16/16
+
+## KM_API (запросы)
+- km.version() -> km.MAKCU
+- km.device() -> R:MK;M:8uf;K:8uf;C:0uf
+- km.baud() -> 4000000
+- km.echo() -> 0
+- km.buttons() -> 1
+- km.keys() -> 0
+- km.controller() -> 0
+- km.stream(mouse) -> 1
+- km.stream(keyboard) -> 0
+- km.stream(controller) -> 0
+- km.screen() -> km.screen(1920,1080)
+- km.getpos() -> km.getpos(0,897)
+- km.moving() -> 0
+- km.left() -> 0
+- km.right() -> 0
+- km.middle() -> 0
+- km.side1() -> 0
+- km.side2() -> 0
+- km.lock_mx() -> 0
+- km.lock_my() -> 0
+- km.lock_mw() -> 0
+- km.lock_mx+() -> 0
+- km.lock_mx-() -> 0
+- km.lock_my+() -> 0
+- km.lock_my-() -> 0
+- km.lock_mw+() -> 0
+- km.lock_mw-() -> 0
+- km.lock_ml() -> 0
+- km.lock_mr() -> 0
+- km.lock_mm() -> 0
+- km.lock_ms1() -> 0
+- km.lock_ms2() -> 0
+
+## Настройки устройства (SDK readDeviceSettings)
+- info: sections 0x04 (1=controller 2=translation 4=mouse), kinds 0x03, save_state 0, revision 2486104977
+- mouse_spread_percent (= интерполяция 0x1F): 0
+- controller: interpolation 2 (0 off, 1 fixed, 2 auto), buffer_ms 8, timing_variance 0%, curve_enabled 0, legacy_strengths 0/0/0, profile 0 из 1
+  - behavior 0 (right stick) 'Linear': enabled 1, strength 0% (present 0), curve 0, advanced 0, inertia 0, micro 0, limit 0, magnitude_var 0, angle_var 0
+    curve[0]: deadzone 0, anti_deadzone 0, deadband 0, points (0,0) (25,25) (50,50) (75,75) (100,100)
+  - behavior 1 (left stick) '': enabled 0, strength 0% (present 0), curve 0, advanced 0, inertia 0, micro 0, limit 0, magnitude_var 0, angle_var 0
+    curve[1]: deadzone 0, anti_deadzone 0, deadband 0, points (0,0) (0,0) (0,0) (0,0) (0,0)
+  - behavior 2 (left trigger) '': enabled 0, strength 0% (present 0), curve 0, advanced 0, inertia 0, micro 0, limit 0, magnitude_var 0, angle_var 0
+    curve[2]: deadzone 0, anti_deadzone 0, deadband 0, points (0,0) (0,0) (0,0) (0,0) (0,0)
+  - behavior 3 (right trigger) '': enabled 0, strength 0% (present 0), curve 0, advanced 0, inertia 0, micro 0, limit 0, magnitude_var 0, angle_var 0
+    curve[3]: deadzone 0, anti_deadzone 0, deadband 0, points (0,0) (0,0) (0,0) (0,0) (0,0)
+- translation 0 (left stick/WASD): enabled 0, scale 1, timeout_ms 50
+- translation 1 (right stick/mouse): enabled 0, scale 1, timeout_ms 50
+- translation 2 (left trigger): enabled 0, scale 100, timeout_ms 50
+- translation 3 (right trigger): enabled 0, scale 100, timeout_ms 50
+- образ настроек (400 байт: 0..371 controller, 372..395 translation, 396 mouse spread, 397..399):
+    000: 00 00 00 00 02 00 00 00 08 00 00 00 00 00 00 00 01 00 00 00 01 00 00 00 06 0F 00 00 4C 69 6E 65
+    032: 61 72 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 05 00 00 19 19 32 32 4B 4B
+    064: 64 64 00 00 00 05 00 00 19 19 32 32 4B 4B 64 64 00 00 00 05 00 00 19 19 32 32 4B 4B 64 64 00 00
+    096: 00 05 00 00 19 19 32 32 4B 4B 64 64 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    128: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    160: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    192: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    224: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    256: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    288: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    320: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    352: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 32 00 00 00 01 00 32 00
+    384: 00 00 64 00 32 00 00 00 64 00 32 00 00 00 00 00
+
+(BUTTONS возвращён в 1)

@@ -14,12 +14,18 @@
 //  4. Если транспорт занят - дельта не теряется и не ставится в очередь
 //     (никаких пачек), а уходит со следующим тиком.
 //
-// Наблюдение на железе (fw 4076, COM): ПК стабильно шлёт 1000 команд/с, а
-// MAKCU выдаёт ~690 HID-отчётов/с, после касания реальной мыши ~310 до конца
-// непрерывного потока. Темп 800-950 Гц картину не меняет - частоту выхода
-// инжекта задаёт прошивка. Пресеты в makcu_mover.cpp - диагностика этого.
+// Эталонный конвейер (fw 4094, 2026-10-10, см. SOLUTION_1000HZ_RAW_MOVE.md):
+//   траектория p(t) -> [ABCurves Renderer: гладкое намерение за 1 мс ->
+//   целочисленный отчёт] -> Transport::move() раз в 1 мс -> RawComTransport
+//   (Format::RawMove, 0x69) -> ровно один HID-отчёт на команду, ~1000 Гц.
+// С Raw частота HID = частота НЕНУЛЕВЫХ команд: пустой тик = нет отчёта.
+// Старый путь MOVE 0x18 / km.move идёт через интерполятор прошивки
+// (~640-690 Гц, команда режется на несколько отчётов) - только для сравнения.
+// Траектории здесь захардкожены (Pattern) для тестов; в модуле их заменит
+// внешний источник движения.
 #pragma once
 
+#include "abc_renderer.h"
 #include "makcu_transport.h"
 #include "mover_common.h"
 
@@ -27,11 +33,14 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <memory>
+#include <random>
 #include <string>
+#include <vector>
 
 namespace mover {
 
-enum class Pattern { Circle, Eight, Line, Ramp, Wobble };
+enum class Pattern { Circle, Eight, Line, Ramp, Wobble, Flicks };
 
 inline const char* patternName(Pattern p) {
     switch (p) {
@@ -40,6 +49,7 @@ inline const char* patternName(Pattern p) {
     case Pattern::Line: return "line";
     case Pattern::Ramp: return "ramp";
     case Pattern::Wobble: return "wobble";
+    case Pattern::Flicks: return "flicks";
     }
     return "?";
 }
@@ -49,15 +59,58 @@ struct Point {
     double y;
 };
 
+// Один "рывок" к цели: старт в startMs из точки from в точку to за durMs по
+// профилю минимального рывка (Flash & Hogan): колоколообразная скорость, как у
+// руки. Между рывками - пауза (позиция стоит).
+struct FlickSeg {
+    double startMs;
+    double durMs;
+    Point from;
+    Point to;
+};
+
+// Последовательность рывков на durationMs: случайные цели в квадрате
+// +-size вокруг старта, длительность по закону Фиттса (дальше - дольше),
+// паузы 120-450 мс. Детерминирована seed'ом.
+inline std::shared_ptr<const std::vector<FlickSeg>> makeFlicks(uint64_t seed, double durationMs, double size) {
+    auto segs = std::make_shared<std::vector<FlickSeg>>();
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    Point cur{0.0, 0.0};
+    double t = 150.0;
+    while (t < durationMs) {
+        Point to{(uni(rng) * 2.0 - 1.0) * size, (uni(rng) * 2.0 - 1.0) * size};
+        const double dist = std::hypot(to.x - cur.x, to.y - cur.y);
+        if (dist < 25.0) continue;
+        const double dur = 110.0 + 75.0 * std::log2(1.0 + dist / 30.0) + uni(rng) * 40.0;
+        segs->push_back({t, dur, cur, to});
+        cur = to;
+        t += dur + 120.0 + uni(rng) * 330.0;
+    }
+    return segs;
+}
+
 // Траектории постоянной (или ограниченной снизу) скорости: на каждом тике
 // есть ненулевая дельта, иначе пустой тик = нет HID-отчёта = "провал" поллинга.
 struct Trajectory {
     Pattern pattern = Pattern::Circle;
     double speed = 2.0;   // пикс/мс (= отсчётов/мс)
     double size = 150.0;  // радиус / амплитуда, пикс
+    std::shared_ptr<const std::vector<FlickSeg>> flicks;  // для Pattern::Flicks
 
     [[nodiscard]] Point at(double tauMs) const {
         switch (pattern) {
+        case Pattern::Flicks: {
+            if (!flicks || flicks->empty()) return {0.0, 0.0};
+            // Последний рывок, начавшийся не позже tau.
+            auto it = std::upper_bound(flicks->begin(), flicks->end(), tauMs,
+                [](double t, const FlickSeg& s) { return t < s.startMs; });
+            if (it == flicks->begin()) return flicks->front().from;
+            const FlickSeg& s = *(it - 1);
+            const double u = std::clamp((tauMs - s.startMs) / s.durMs, 0.0, 1.0);
+            const double m = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));  // минимальный рывок
+            return {s.from.x + (s.to.x - s.from.x) * m, s.from.y + (s.to.y - s.from.y) * m};
+        }
         case Pattern::Circle: {
             const double w = speed / size;  // рад/мс, |v| = speed
             return {size * std::cos(w * tauMs) - size, size * std::sin(w * tauMs)};
@@ -104,6 +157,11 @@ struct RunConfig {
     // (траектория на это время замирает, прыжка после паузы нет).
     double pauseEveryS = 0.0;
     double pauseMs = 0.0;
+    // ABCurves Renderer: если задан, каждый тик 1 мс гладкое смещение
+    // траектории проходит через рендерер, а отправляются его целочисленные
+    // отчёты (частота принудительно 1000 Гц - модель обучена на 1 мс).
+    AbcRenderer* renderer = nullptr;
+    uint64_t rendererSeed = 2026;
 };
 
 // Живые счётчики: пишет поток тайминга, читает UI.
@@ -127,6 +185,8 @@ struct LiveStats {
     std::atomic<double> runLateMaxUs{0.0};
     std::array<std::atomic<uint64_t>, 6> lateHist{};
     std::atomic<double> elapsedS{0.0};
+    std::atomic<bool> rendererError{false};
+    std::atomic<uint64_t> rendererReports{0};  // ненулевых отчётов рендерера
 
     void reset() {
         running = false;
@@ -144,6 +204,8 @@ struct LiveStats {
         runLateMaxUs = 0.0;
         for (auto& h : lateHist) h = 0;
         elapsedS = 0.0;
+        rendererError = false;
+        rendererReports = 0;
     }
 };
 
@@ -179,6 +241,30 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
         return false;
     };
 
+    // --- ABCurves Renderer ---
+    AbcRenderer* renderer = cfg.renderer;
+    Point prevP = cfg.trajectory.at(0.0);
+    uint64_t renderedK = 0;
+    int64_t pendX = 0;  // отчёты рендерера, ещё не ушедшие в порт
+    int64_t pendY = 0;
+    auto renderTick = [&](double sdx, double sdy) {
+        Report16 r{};
+        if (!renderer->step(sdx, sdy, r)) return false;
+        if (r.dx != 0 || r.dy != 0) {
+            pendX += r.dx;
+            pendY += r.dy;
+            live.rendererReports.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    };
+    if (renderer) {
+        std::string err;
+        if (!renderer->beginEvent(cfg.rendererSeed, err)) {
+            live.rendererError = true;
+            return;
+        }
+    }
+
     live.running = true;
     const int64_t start = Clock::now() + Clock::fromUs(2000.0);
     int64_t t0 = start;
@@ -208,7 +294,31 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
         }
 
         const double wallMs = static_cast<double>(k) * periodMs;
-        if (cfg.pauseEveryS > 0.0 && cfg.pauseMs > 0.0 && wallMs >= 1000.0 * cfg.pauseEveryS &&
+        if (renderer) {
+            // Шагаем рендерер по каждому тику 1 мс, включая пропущенные:
+            // его внутренние часы - это и есть 1-мс отсчёты.
+            bool ok = true;
+            for (uint64_t j = renderedK + 1; j <= k && ok; ++j) {
+                const Point p = cfg.trajectory.at(static_cast<double>(j) * periodMs);
+                ok = renderTick(p.x - prevP.x, p.y - prevP.y);
+                prevP = p;
+            }
+            renderedK = k;
+            if (!ok) {
+                live.rendererError = true;
+                break;
+            }
+            if (pendX != 0 || pendY != 0) {
+                const int64_t dx = std::clamp<int64_t>(pendX, -32767, 32767);
+                const int64_t dy = std::clamp<int64_t>(pendY, -32767, 32767);
+                if (sendDelta(dx, dy)) {
+                    pendX -= dx;
+                    pendY -= dy;
+                } else if (!tx.healthy()) {
+                    break;
+                }
+            }
+        } else if (cfg.pauseEveryS > 0.0 && cfg.pauseMs > 0.0 && wallMs >= 1000.0 * cfg.pauseEveryS &&
             std::fmod(wallMs, 1000.0 * cfg.pauseEveryS) < cfg.pauseMs) {
             pausedMs += periodMs;
             ++k;
@@ -216,13 +326,15 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
             continue;
         }
 
-        // Траектория в номинальный момент тика.
-        const Point p = cfg.trajectory.at(wallMs - pausedMs);
-        const int64_t dx = std::clamp<int64_t>(std::llround(p.x) - sentX, -32767, 32767);
-        const int64_t dy = std::clamp<int64_t>(std::llround(p.y) - sentY, -32767, 32767);
-        if (dx != 0 || dy != 0) {
-            if (!sendDelta(dx, dy) && !tx.healthy()) {
-                break;
+        if (!renderer) {
+            // Траектория в номинальный момент тика.
+            const Point p = cfg.trajectory.at(wallMs - pausedMs);
+            const int64_t dx = std::clamp<int64_t>(std::llround(p.x) - sentX, -32767, 32767);
+            const int64_t dy = std::clamp<int64_t>(std::llround(p.y) - sentY, -32767, 32767);
+            if (dx != 0 || dy != 0) {
+                if (!sendDelta(dx, dy) && !tx.healthy()) {
+                    break;
+                }
             }
         }
 
@@ -255,6 +367,28 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
         live.ticks.store(k, std::memory_order_relaxed);
         live.elapsedS.store(Clock::toUs(now - start) / 1e6, std::memory_order_relaxed);
     }
+
+    // Рендерер держит дробный остаток пути: дошагиваем нулевым намерением
+    // (до 120 мс), чтобы он выпустил накопленное, и отправляем хвост.
+    if (renderer && !live.rendererError.load() && !live.stopRequest.load()) {
+        int64_t due = Clock::now();
+        int quiet = 0;
+        for (int i = 0; i < 120 && quiet < 30; ++i) {
+            due += periodTicks;
+            waiter.waitUntil(due);
+            if (!renderTick(0.0, 0.0)) break;
+            if (pendX == 0 && pendY == 0) {
+                ++quiet;
+                continue;
+            }
+            quiet = 0;
+            if (sendDelta(std::clamp<int64_t>(pendX, -32767, 32767), std::clamp<int64_t>(pendY, -32767, 32767))) {
+                pendX = 0;
+                pendY = 0;
+            }
+        }
+    }
+    tx.finish();  // raw-транспорт: дождаться квитанций и дослать перенос
     live.running = false;
 }
 
