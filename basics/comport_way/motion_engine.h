@@ -28,6 +28,7 @@
 #include "abc_renderer.h"
 #include "makcu_transport.h"
 #include "mover_common.h"
+#include "substepper.h"
 
 #include <algorithm>
 #include <array>
@@ -40,7 +41,7 @@
 
 namespace mover {
 
-enum class Pattern { Circle, Eight, Line, Ramp, Wobble, Flicks };
+enum class Pattern { Circle, Eight, Line, Ramp, Wobble, Flicks, Steps };
 
 inline const char* patternName(Pattern p) {
     switch (p) {
@@ -50,9 +51,15 @@ inline const char* patternName(Pattern p) {
     case Pattern::Ramp: return "ramp";
     case Pattern::Wobble: return "wobble";
     case Pattern::Flicks: return "flicks";
+    case Pattern::Steps: return "steps";
     }
     return "?";
 }
+
+// Лестница скоростей (Pattern::Steps) для замера "скорость -> частота":
+// по kStepLevelMs на уровень, отсчётов/мс, туда-обратно по X (не уходит за край).
+inline constexpr std::array<double, 12> kStepSpeeds{0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0};
+inline constexpr double kStepLevelMs = 2000.0;
 
 struct Point {
     double x;
@@ -131,12 +138,49 @@ struct Trajectory {
             // Только вправо с постоянной скоростью: без разворотов сумма
             // сырых отсчётов в Raw Input точна (для замера потерь пути).
             return {speed * tauMs, 0.0};
+        case Pattern::Steps: {
+            // Пройденный путь при ступенчатой скорости, затем "складываем" его в отрезок.
+            double d = 0.0;
+            double t = tauMs;
+            for (size_t i = 0; i < kStepSpeeds.size() && t > 0.0; ++i) {
+                const double span = i + 1 == kStepSpeeds.size() ? t : std::min(t, kStepLevelMs);
+                d += kStepSpeeds[i] * span;
+                t -= span;
+            }
+            const double span = 2.0 * size;
+            const double f = std::fmod(d, 2.0 * span);
+            return {f <= span ? f : 2.0 * span - f, 0.0};
+        }
         case Pattern::Wobble:
             // Как ramp, но Y дрожит на 1-2 отсчёта с несоизмеримым периодом:
             // соседние HID-отчёты почти никогда не совпадают байт в байт.
             return {speed * tauMs, 1.6 * std::sin(tauMs * 2.17) + 0.9 * std::sin(tauMs * 0.71)};
         }
         return {0.0, 0.0};
+    }
+};
+
+// Журнал тиков для замера "скорость -> частота" (rate_probe.h). Память
+// выделяется до старта, поток тайминга только дописывает в пределах ёмкости.
+struct TickLog {
+    std::vector<int64_t> tSend;   // QPC момента обработки тика (отправка его отчёта)
+    std::vector<float> speed;     // |намерение| за тик, отсчётов/мс
+    std::vector<uint8_t> report;  // 1 - субстеппер/рендерер выдал ненулевой отчёт
+
+    void reserve(size_t n) {
+        tSend.clear();
+        speed.clear();
+        report.clear();
+        tSend.reserve(n);
+        speed.reserve(n);
+        report.reserve(n);
+    }
+    void push(int64_t t, float v, bool r) {
+        if (tSend.size() < tSend.capacity()) {
+            tSend.push_back(t);
+            speed.push_back(v);
+            report.push_back(r ? 1 : 0);
+        }
     }
 };
 
@@ -162,6 +206,12 @@ struct RunConfig {
     // отчёты (частота принудительно 1000 Гц - модель обучена на 1 мс).
     AbcRenderer* renderer = nullptr;
     uint64_t rendererSeed = 2026;
+    // Субстеппер с накопителем (substepper.h): тот же шаг 1 мс, что у рендерера,
+    // но отчёт = округлённое накопленное намерение, без текстуры. Игнорируется,
+    // если задан renderer. Частота принудительно 1000 Гц.
+    bool substep = false;
+    // Если задан - каждый тик 1 мс пишется сюда (скорость, был ли отчёт, время).
+    TickLog* log = nullptr;
 };
 
 // Живые счётчики: пишет поток тайминга, читает UI.
@@ -243,14 +293,25 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
 
     // --- ABCurves Renderer ---
     AbcRenderer* renderer = cfg.renderer;
+    Accumulator accumulator;
+    // Шаг на каждую 1 мс: рендерер или накопитель. Иначе - старая схема
+    // "позиция в момент тика" на произвольной частоте команд.
+    const bool perTick = renderer || cfg.substep;
+    int64_t tickNow = 0;  // время обработки текущего тика (для журнала)
     Point prevP = cfg.trajectory.at(0.0);
     uint64_t renderedK = 0;
     int64_t pendX = 0;  // отчёты рендерера, ещё не ушедшие в порт
     int64_t pendY = 0;
     auto renderTick = [&](double sdx, double sdy) {
         Report16 r{};
-        if (!renderer->step(sdx, sdy, r)) return false;
-        if (r.dx != 0 || r.dy != 0) {
+        if (renderer) {
+            if (!renderer->step(sdx, sdy, r)) return false;
+        } else {
+            r = accumulator.step(sdx, sdy);
+        }
+        const bool nonzero = r.dx != 0 || r.dy != 0;
+        if (cfg.log) cfg.log->push(tickNow, static_cast<float>(std::hypot(sdx, sdy)), nonzero);
+        if (nonzero) {
             pendX += r.dx;
             pendY += r.dy;
             live.rendererReports.fetch_add(1, std::memory_order_relaxed);
@@ -273,6 +334,7 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
         int64_t due = t0 + static_cast<int64_t>(std::llround(static_cast<double>(k) * periodTicksF));
         waiter.waitUntil(due);
         const int64_t now = Clock::now();
+        tickNow = now;
         int64_t late = now - due;
 
         if (late > catchupLimit) {
@@ -294,7 +356,7 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
         }
 
         const double wallMs = static_cast<double>(k) * periodMs;
-        if (renderer) {
+        if (perTick) {
             // Шагаем рендерер по каждому тику 1 мс, включая пропущенные:
             // его внутренние часы - это и есть 1-мс отсчёты.
             bool ok = true;
@@ -326,7 +388,7 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
             continue;
         }
 
-        if (!renderer) {
+        if (!perTick) {
             // Траектория в номинальный момент тика.
             const Point p = cfg.trajectory.at(wallMs - pausedMs);
             const int64_t dx = std::clamp<int64_t>(std::llround(p.x) - sentX, -32767, 32767);
@@ -376,6 +438,7 @@ inline void runMotion(const RunConfig& cfg, Transport& tx, LiveStats& live) {
         for (int i = 0; i < 120 && quiet < 30; ++i) {
             due += periodTicks;
             waiter.waitUntil(due);
+            tickNow = Clock::now();
             if (!renderTick(0.0, 0.0)) break;
             if (pendX == 0 && pendY == 0) {
                 ++quiet;

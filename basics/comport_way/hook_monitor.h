@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <thread>
+#include <vector>
 
 namespace mover {
 
@@ -22,10 +23,22 @@ public:
     static constexpr std::array<const char*, 6> kBucketNames{
         "< 0.75 мс", "0.75-1.25 (1 кадр)", "1.25-1.75", "1.75-2.5 (2 кадра)", "2.5-5", "> 5 мс"};
 
+    // Событие для журнала: время QPC и позиция курсора (pt хука, экранные
+    // координаты). При выключенной "Повышенной точности" и скорости указателя
+    // 10/20 разность pt соседних событий = сырые отсчёты (пока курсор не у края).
+    struct Event {
+        int64_t t;
+        int32_t x;
+        int32_t y;
+    };
+    static constexpr size_t kLogCapacity = 1u << 19;  // ~8 мин при 1000 Гц, 8 МБ
+
     ~HookMonitor() { stop(); }
 
     bool start() {
         if (thread_.joinable()) return true;
+        // Память журнала - один раз, до появления потока хука (дальше не перевыделяется).
+        if (log_.empty()) log_.resize(kLogCapacity);
         instance_ = this;
         ready_ = false;
         thread_ = std::thread([this] { threadMain(); });
@@ -46,6 +59,20 @@ public:
         for (auto& b : hist_) b.store(0);
     }
 
+    // Журнал событий: начать с нуля / остановить и забрать копию.
+    void startLog() {
+        logging_.store(false, std::memory_order_release);
+        Sleep(5);  // хук мог быть внутри onEvent с прошлого журнала
+        logN_.store(0, std::memory_order_release);
+        logging_.store(true, std::memory_order_release);
+    }
+    std::vector<Event> stopLog() {
+        logging_.store(false, std::memory_order_release);
+        Sleep(5);  // дать хуку дописать событие, если он был внутри onEvent
+        const size_t n = logN_.load(std::memory_order_acquire);
+        return std::vector<Event>(log_.begin(), log_.begin() + static_cast<std::ptrdiff_t>(n));
+    }
+
     [[nodiscard]] uint64_t count() const { return count_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::array<uint64_t, 6> histogram() const {
         std::array<uint64_t, 6> h{};
@@ -58,14 +85,21 @@ private:
         if (code == HC_ACTION && wp == WM_MOUSEMOVE && instance_) {
             const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
             if (!(info->flags & LLMHF_INJECTED)) {  // SendInput не считаем, MAKCU - железо
-                instance_->onEvent();
+                instance_->onEvent(info->pt);
             }
         }
         return CallNextHookEx(nullptr, code, wp, lp);
     }
 
-    void onEvent() {
+    void onEvent(POINT pt) {
         const int64_t now = Clock::now();
+        if (logging_.load(std::memory_order_acquire)) {
+            const size_t n = logN_.load(std::memory_order_relaxed);
+            if (n < log_.size()) {
+                log_[n] = {now, pt.x, pt.y};
+                logN_.store(n + 1, std::memory_order_release);
+            }
+        }
         const int64_t prev = last_.exchange(now, std::memory_order_relaxed);
         count_.fetch_add(1, std::memory_order_relaxed);
         if (prev != 0) {
@@ -99,6 +133,9 @@ private:
     std::atomic<uint64_t> count_{0};
     std::atomic<int64_t> last_{0};
     std::array<std::atomic<uint64_t>, 6> hist_{};
+    std::vector<Event> log_;
+    std::atomic<size_t> logN_{0};
+    std::atomic<bool> logging_{false};
 };
 
 }  // namespace mover

@@ -8,6 +8,7 @@
 #include "abc_renderer.h"
 #include "hook_monitor.h"
 #include "rawinput_monitor.h"
+#include "rate_probe.h"
 
 #include <makxd.h>
 
@@ -92,6 +93,7 @@ struct Options {
     std::string abcModel;        // путь к renderer_global_h80.bin
     std::string abcProfile;      // CSV из 256 отчётов
     uint64_t abcSeed = 0;        // 0 - новый seed на каждый прогон
+    bool substep = false;        // прогон --run через субстеппер с накопителем (1000 Гц)
     bool runOnce = false;
     bool check = false;
     bool sweep = false;
@@ -184,7 +186,8 @@ void printUsage() {
         "                       (частота --hz, траектория по умолчанию ramp - точный учёт пути)\n"
         "  --pause-every S      диагностика: каждые S секунд пауза --pause-ms\n"
         "  --pause-ms M         длительность паузы, мс\n"
-        "  --pattern circle|eight|line\n"
+        "  --pattern circle|eight|line|ramp|wobble|flicks|steps  (steps - лестница скоростей 0.05..8\n"
+        "                       отсчётов/мс по 2 с, для замера скорость -> частота)\n"
         "  --speed V            скорость, пикс/мс (по умолчанию 4.0; для оверсэмплинга нужно >= 3)\n"
         "  --size S             радиус/амплитуда, пикс (150)\n"
         "  --duration S         длительность прогона, с (10)\n"
@@ -198,6 +201,9 @@ void printUsage() {
         "  --abc-model PATH     модель рендерера (по умолч. ..\\..\\ABCurves\\models\\renderer_global_h80.bin)\n"
         "  --abc-profile PATH   профиль: CSV из 256 отчётов dx,dy (по умолч. profiles\\human_start_256.csv)\n"
         "  --abc-seed N         seed рендерера и рывков (по умолчанию новый на каждый прогон)\n"
+        "  --substep            прогон --run через субстеппер с накопителем: шаг 1 мс, отчёт = округлённое\n"
+        "                       накопленное намерение, без шума; после прогона - таблица скорость -> частота\n"
+        "                       (лучше с --pattern steps или flicks)\n"
         "  --run                один прогон с этими параметрами и выход (без меню)\n"
         "  --check              проверка связи + тест тайминга MOVE(0,0) 2 с (курсор не двигается)\n");
 }
@@ -250,6 +256,7 @@ bool parseOptions(int argc, char** argv, Options& o) {
             else if (v == "ramp") o.pattern = Pattern::Ramp;
             else if (v == "wobble") o.pattern = Pattern::Wobble;
             else if (v == "flicks") o.pattern = Pattern::Flicks;
+            else if (v == "steps") o.pattern = Pattern::Steps;
             else return false;
         } else if (a == "--speed") o.speed = std::atof(next("--speed"));
         else if (a == "--size") o.size = std::atof(next("--size"));
@@ -263,6 +270,7 @@ bool parseOptions(int argc, char** argv, Options& o) {
         else if (a == "--spread") o.spread = std::atoi(next("--spread"));
         else if (a == "--keep-accel") o.keepAccel = true;
         else if (a == "--abc") o.abc = true;
+        else if (a == "--substep") o.substep = true;
         else if (a == "--abc-model") o.abcModel = next("--abc-model");
         else if (a == "--abc-profile") o.abcProfile = next("--abc-profile");
         else if (a == "--abc-seed") o.abcSeed = std::strtoull(next("--abc-seed"), nullptr, 10);
@@ -791,6 +799,7 @@ struct Preset {
     int sweep = 0;    // 1 - перебор без касания, 2 - перебор после касания
     int spread = -1;  // mouse spread перед стартом (live, без NOR); -1 - не трогать
     bool abc = false; // через ABCurves Renderer
+    bool substep = false; // через субстеппер с накопителем
 };
 
 // Транспорт пресетов - из --tx (по умолчанию rawmove). Замеры на 4094
@@ -801,11 +810,14 @@ const Preset kPresets[] = {
     {VK_F1, "F1", " 250 Гц | 30 с", 250, 0, 0, {}, 30.0},
     {VK_F2, "F2", "1000 Гц | 30 с (основной режим)", 1000, 0, 0, {}, 30.0},
     {VK_F3, "F3", "ABCurves | рывки к целям | 30 с", 1000, 0, 0, Pattern::Flicks, 30.0, 0, -1, true},
-    {VK_F4, "F4", "без рендерера | те же рывки | 30 с (сравнение)", 1000, 0, 0, Pattern::Flicks, 30.0},
+    {VK_F4, "F4", "накопитель (без рендерера) | те же рывки | 30 с (сравнение)", 1000, 0, 0, Pattern::Flicks, 30.0,
+        0, -1, false, true},
     {VK_F5, "F5", "ABCurves | круг | 30 с", 1000, 0, 0, Pattern::Circle, 30.0, 0, -1, true},
     {VK_F6, "F6", "ПЕРЕБОР 125..2000 Гц: HID + путь, мышь не трогать (~25 с)", 0, 0, 0, {}, {}, 1},
     {VK_F7, "F7", "ПЕРЕБОР ПОСЛЕ КАСАНИЯ: 6 с с касанием, затем 125..2000 Гц", 0, 0, 0, {}, {}, 2},
     {VK_F8, "F8", "1000 Гц | линия 60 с (тест с рукой)", 1000, 0, 0, Pattern::Line, 60.0},
+    {VK_F10, "F10", "накопитель | лестница скоростей 0.05..8 отсч/мс по 2 с | 24 с (скорость -> частота)", 1000, 0,
+        0, Pattern::Steps, 24.0, 0, -1, false, true},
 };
 
 constexpr int kSpreadSteps[] = {0, 5, 10, 25, 50, 100};
@@ -863,6 +875,9 @@ void printSummary(const RunConfig& cfg, const Transport& tx, RawInputMonitor& mo
 
     std::printf("Повышенная точность указателя сейчас: %s\n",
         pointerAccelOn() ? "ВКЛЮЧЕНА (курсор будет ускоряться при крупных дельтах!)" : "выключена");
+    if (cfg.substep && !cfg.renderer) {
+        std::printf("Накопитель: ненулевых отчётов %.0f/с\n", l.rendererReports.load() / elapsed);
+    }
     if (cfg.renderer) {
         std::printf("ABCurves Renderer: ненулевых отчётов %.0f/с (seed %llu)%s\n",
             l.rendererReports.load() / elapsed, static_cast<unsigned long long>(cfg.rendererSeed),
@@ -979,13 +994,29 @@ HidWindowStats runAndWatch(const RunConfig& cfg, Transport& tx, int stopVk, bool
     return s;
 }
 
-void runOnce(const RunConfig& cfg, Transport& tx, RawInputMonitor& monitor, int stopVk) {
+void runOnce(const RunConfig& base, Transport& tx, RawInputMonitor& monitor, int stopVk) {
+    // Шаг 1 мс (рендерер или накопитель) - пишем журнал тиков и событий хука
+    // для таблицы "скорость -> частота".
+    RunConfig cfg = base;
+    TickLog log;
+    const bool probe = cfg.renderer || cfg.substep;
+    if (probe) {
+        log.reserve(static_cast<size_t>(cfg.durationS * 1000.0) + 2000);
+        cfg.log = &log;
+        g_hook.startLog();
+    }
     monitor.reset();
     std::printf("\n>>> СТАРТ: %s | %s | %s | %.1f с  (стоп: %s / ESC)\n", cfg.label.c_str(), tx.name(),
         patternName(cfg.trajectory.pattern), cfg.durationS, stopVk ? "та же F-клавиша" : "ESC");
     const HidWindowStats hid = runAndWatch(cfg, tx, stopVk, true);
     Sleep(50);  // дать Raw Input дособрать последние сообщения
     printSummary(cfg, tx, monitor, hid);
+    if (probe) {
+        const RateSeries series = seriesFromRun(log, g_hook.stopLog());
+        printRateTable(series, cfg.renderer ? "ABCurves Renderer" : "Накопитель");
+        const std::string csv = exeDir() + (cfg.renderer ? "\\rate_abc.csv" : "\\rate_substep.csv");
+        if (writeRateCsv(series, csv)) std::printf("  по миллисекундам: %s\n", csv.c_str());
+    }
 }
 
 RunConfig makeConfig(const Options& o, double hz, int burst, Pattern pattern, double durationS, std::string label,
@@ -1012,6 +1043,12 @@ RunConfig makeConfig(const Options& o, double hz, int burst, Pattern pattern, do
     return cfg;
 }
 
+RunConfig withSubstep(RunConfig cfg) {
+    cfg.substep = true;
+    cfg.hz = 1000.0;  // накопитель шагает по 1 мс, как рендерер
+    return cfg;
+}
+
 RunConfig withRenderer(RunConfig cfg) {
     cfg.renderer = &g_abc;
     cfg.hz = 1000.0;  // модель обучена на тиках 1 мс
@@ -1021,14 +1058,21 @@ RunConfig withRenderer(RunConfig cfg) {
 // Калибровка замера: без инжекта, человек водит реальной мышью. Если хук
 // покажет ~1000 Гц, как и тестер, хуку можно верить и в остальных режимах.
 void measureHand(int stopVk) {
-    std::printf("\n>>> ЗАМЕР РУКИ: 6 с, инжекта нет - быстро и непрерывно водите реальной мышью\n");
+    std::printf("\n>>> ЗАМЕР РУКИ: 15 с, инжекта нет - водите реальной мышью в середине экрана с РАЗНОЙ\n"
+                "    скоростью: очень медленно, медленно, средне, быстро (по несколько секунд)\n");
+    int pointerSpeed = 0;
+    if (SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &pointerSpeed, 0) && pointerSpeed != 10) {
+        std::printf("[!] Скорость указателя Windows %d/20 (не 10): скорость руки в таблице будет не в отсчётах\n",
+            pointerSpeed);
+    }
     g_hook.reset();
+    g_hook.startLog();
     KeyEdge keys;
     keys.sync();
     uint64_t last = 0;
     int64_t t = Clock::now();
     std::vector<double> rates;
-    for (int sec = 0; sec < 6 && !g_exit.load(); ++sec) {
+    for (int sec = 0; sec < 15 && !g_exit.load(); ++sec) {
         const int64_t until = t + Clock::fromUs(1e6);
         bool stop = false;
         while (Clock::now() < until) {
@@ -1052,6 +1096,10 @@ void measureHand(int stopVk) {
         if (h[i]) std::printf("  %s: %.1f%%", HookMonitor::kBucketNames[i], 100.0 * h[i] / std::max<uint64_t>(1, total));
     }
     std::printf("\n  Сравните с тестером: при ~1000 Гц в обоих замер хука верный.\n");
+    const RateSeries series = seriesFromHand(g_hook.stopLog());
+    printRateTable(series, "Рука");
+    const std::string csv = exeDir() + "\\rate_hand.csv";
+    if (writeRateCsv(series, csv)) std::printf("  по миллисекундам: %s\n", csv.c_str());
 }
 
 // Перебор частот команд: таблица "команд/с -> HID Гц и путь". Траектория -
@@ -1389,7 +1437,7 @@ void printMenu(Pattern pattern, const Options& o, int spread) {
         patternName(pattern), o.speed, o.size, o.durationS);
     std::printf("   [F11] mouse spread: сейчас %d%% -> по кругу 0/5/10/25/50/100 (live, при выходе вернётся)\n",
         spread);
-    std::printf("   [F12] замер руки 6 с без инжекта (калибровка: сравнить HID с тестером)\n");
+    std::printf("   [F12] замер руки 15 с без инжекта: HID + таблица скорость -> частота (эталон для F4/F10)\n");
     std::printf("   [ESC] или та же F-клавиша - стоп прогона      [END] - выход\n");
     std::printf("=================================================================================\n");
 }
@@ -1487,7 +1535,11 @@ int main(int argc, char** argv) {
             Sleep(300);
             RunConfig cfg =
                 makeConfig(opt, opt.hz, opt.burst, opt.pattern, opt.durationS, label, opt.pauseEveryS, opt.pauseMs);
-            if (opt.abc) {
+            if (opt.substep && !opt.abc) {
+                cfg = withSubstep(cfg);
+                cfg.label += " | накопитель";
+                runOnce(cfg, *tx, monitor, 0);
+            } else if (opt.abc) {
                 if (!g_abcReady) {
                     std::printf("[-] --abc: ABCurves Renderer не загружен\n");
                 } else {
@@ -1557,6 +1609,7 @@ int main(int argc, char** argv) {
                 RunConfig cfg = makeConfig(opt, p.hz, 0, p.pattern.value_or(pattern),
                     p.durationS.value_or(opt.durationS), label, p.pauseEveryS, p.pauseMs);
                 if (p.abc) cfg = withRenderer(cfg);
+                if (p.substep) cfg = withSubstep(cfg);
                 runOnce(cfg, *tx, monitor, p.vk);
                 if (!tx->healthy()) {
                     std::printf("[-] Транспорт сообщил об ошибке (устройство отключено?)\n");
