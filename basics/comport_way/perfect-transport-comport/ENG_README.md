@@ -23,12 +23,41 @@ auto-reconnect after USB2 is unplugged, state reset on `open()` and `close()`. T
 logic did not change (after the change: 2000 = 2000 = 2000, rejections 0). The write ring is now under a
 mutex: a button can be pressed from any thread, and it goes out at once, without waiting for `move()`.
 
+**Revision 2026-10-30 (5): the cursor stops at once, one-command locks, live-mouse counts** — the same as the
+UDP reference revisions 4–5, the same API; both headers build in one program. *Short summary; the full
+tables are in [`README.md`](README.md).*
+- **Movement queue depth** `setMaxLag(n)`, default 1. Over COM the queue grows from clock drift, not from
+  stalls: the board's clock runs about 45 ppm behind QPC, so the tail after the last `move()` reached 3.6 ms
+  after 60 s (ceiling ~10 ms). Now a delta is added to the next record once the estimate reaches the
+  cap: tail **0.7–1.6 ms**, also after 60 s, 1 merge per ~4 s (0.03 %), exact path. `0` restores the old behaviour.
+- **`stopMovement()`**: "freeze". Drops the carry; what the board already holds plays out. The cursor stops
+  after **1.1 ms median, max 1.6** with the mouse untouched.
+- **Direction locks with one `0x16`**, wheel with one `0x17`, buttons with `0x60`. `setLocks({X, Y})`: physical
+  movement stops after **0.42 ms median, max 0.95**.
+- **Live-mouse counts** `setTracking(true)` / `physical()`: `GET 0x63` about 1700 times/s while there is no
+  injection. The sum matches Raw Input to the count; `km.screen` is 32767×32767 meanwhile, then restored.
+
+**Known limit: hand on the mouse.** If the physical mouse moves during injection, the tail is **4.5–5.4 ms** and
+`setMaxLag` does not reduce it: physical reports take HID slots, the queue fills a hidden buffer of ~5 records
+behind the FIFO and saturates there. `state 2` is reported before delivery, so `0x6A` does not show this queue.
+
+**Known problem, both revisions, unsolved: holes in the report stream.** At 1 kHz a run of consecutive reports
+occasionally vanishes: the records were sent, Windows never gets them, the stream then continues evenly, and the
+path is short by that stretch. The board reports `state 2`, no rejections, no ack repeats, so the transport cannot
+see it. Durations are discrete: 31.8–32.4 ms and 97.6–112.8 ms. Revision 3: 2 holes in ~506 s; revision 5: 10 in
+~1530 s, within chance. They are not tied to clicks and they cluster. Whether the PC or the board loses them is not
+established. An early suspicion (acks in separate writes between ticks) was refuted by revision 3 showing the same holes.
+
+Injected button presses and releases each take a HID report slot, so the estimate counts them: with clicks and
+locks during movement the tail is **0.52–1.48 ms** (revision 3: 3.7–9.3 ms).
+
 ## Files
 
 | File | What it is |
 | --- | --- |
 | `makcu_raw_transport.h` | **the whole transport**: one header, WinAPI only (`setupapi`) |
 | `example_line.cpp` | an embedding example and a self-check on hardware (a model of the 1 ms loop) |
+| `../track_test_com.cpp` | measurement bench (tail, `0x63` vs Raw Input, lock latency, `SET` losses, tracking); window and analysis in the shared `../../track_bench.h` |
 | `controls_test.cpp` | a check of buttons, button and axis locks, reconnect and a long run (a test window, the cursor is confined to it) |
 | `build_example.bat` | build of both: MinGW-w64 g++, C++17+ |
 | `../probe_controls_com.py`, `../probe_controls_gap_com.py` | probes: the `0x56` format over COM, whether a pause is needed after `SET`, whether `SET`s get lost |

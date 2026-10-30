@@ -9,7 +9,8 @@
 
 Этот README — главный документ папки и точка входа для следующей сессии.
 Эталонный транспорт для встраивания в свои программы (движение + кнопки мыши):
-[`perfect-transport-comport/`](perfect-transport-comport/README.md).
+[`perfect-transport-comport/`](perfect-transport-comport/README.md). Стенд замеров эталона: `track_test_com.cpp`
+(хвост инжекта, `0x63` против Raw Input, блокировки, слежение; общий код — `../track_bench.h`).
 
 ---
 

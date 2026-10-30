@@ -3,7 +3,8 @@
 // Один заголовок, без зависимостей кроме WinAPI (SetupAPI для поиска порта).
 // Доставляет целые отчёты (dx, dy) в MAKCU командой Raw movement 0x69 с
 // квитанциями 0x6A: на fw с Raw API (V4.074+, проверено на 4094 и 4097) каждый
-// принятый move() = ровно один HID-отчёт, мимо интерполятора прошивки.
+// принятый move() = один HID-отчёт, мимо интерполятора прошивки; только если очередь
+// отстала на maxLag записей, дельта прибавляется к следующей записи (путь точный).
 //
 // Что транспорт делает:
 //   - свой overlapped-handle COM, кольцо из 32 записей WriteFile (под мьютексом), поток
@@ -13,15 +14,21 @@
 //   - Raw: метаданные 0x6A(id=0), дочистка записей прошлых сессий, окно
 //     живых записей (<= 12 и <= свободно на плате - 2), квитанции, перенос
 //     отказанных дельт, finish() в конце;
+//   - глубина очереди движения (setMaxLag) и stopMovement(): плата отдаёт одну запись на
+//     отчёт мыши, и её часы отстают от QPC (замер: 45 ppm, 1 запись за ~25 с движения);
+//   - физическая мышь (setTracking): опрос позиции платы GET 0x63 ~2 кГц, пока нет инжекта
+//     движения, накопленные отсчёты - physical();
 //   - чтение кнопок мыши: поток INPUT_STREAM mouse (0x52) включается в open(), события
 //     INPUT_CHANGE 0x53 разбирает поток чтения, стартовая маска и пересинхронизация
 //     после переполнения - GET PHYS_BUTTONS 0x55; buttons()/buttonDown()/pressCount();
 //   - инжект кнопок: press()/release() - SET 0x11..0x15 сразу из вызывающего потока,
 //     без очереди за движением, без тайминга и "хуманизации" (время нажатия задаёт
 //     вызывающий);
-//   - блокировки физического ввода: setLock() - SET LOCK 0x60, 14 целей (кнопки, оси,
-//     направления, колесо). Блокировка действует только на физическую мышь: инжект её
-//     обходит, а чтение кнопок (0x53/0x55) видит физику до блокировки;
+//   - блокировки физического ввода: setLock(), 14 целей (кнопки, оси, направления,
+//     колесо). Все направления движения уходят одной SET MOVE_MASK 0x16, колесо - одной
+//     SET WHEEL_MASK 0x17, кнопки - SET LOCK 0x60 (те же биты, что у 0x60). Блокировка
+//     действует только на физическую мышь: инжект её обходит, а чтение кнопок (0x53/0x55)
+//     видит физику до блокировки;
 //   - команды без ответа (кнопки, блокировки) уходят одной записью вместе со снимком
 //     GET INJECT_SNAPSHOT 0x56: что не применилось (команда изредка теряется и по COM),
 //     отправляется заново. Снимок же - пульс связи (раз в 250 мс);
@@ -40,6 +47,9 @@
 // после команды без ответа не нужна (SET -> SET/GET без паузы: 300 из 300), но SET
 // изредка теряется (0.3-0.7 %, бывает кучками) - отсюда сверка снимком после каждой
 // команды. Снимок по COM отвечает за ~0.3 мс.
+// Квитанции 0x6A очередь не показывают (замер 2026-10-30): запись получает state 2 раньше,
+// чем уходит в ПК (за FIFO ещё ~5 записей), повторы ack начинаются с глубины ~6. Поэтому
+// глубина оценивается по времени: отправлено минус отдано (1 запись/мс).
 //
 // Контракт вызова:
 //   - move()/service()/finish() - из ОДНОГО потока (обычно поток тайминга).
@@ -48,12 +58,15 @@
 //   - move() == false: сейчас отправить нельзя (окно/кольцо заняты или связи нет) -
 //     вызывающий оставляет дельту у себя и добавляет к следующему вызову (после
 //     долгого обрыва, возможно, лучше её сбросить). Внутренний перенос (клампинг
-//     >32767, отказ платы) транспорт ведёт сам.
+//     >32767, отказ платы, склейка) транспорт ведёт сам.
 //   - move(0, 0) ничего не отправляет на мышь, только квитанции/перенос (= service()).
 //   - press()/release()/setLock()/..., buttons()/..., stats()/statsLine() - из любого потока.
 //
 // Ревизия 2026-10-12 (2): кнопки мыши. Ревизия 2026-10-12 (3): инжект кнопок, блокировки,
 // переподключение, сброс состояния при open()/close(). Логика Raw-движения не менялась.
+// Ревизия 2026-10-30 (5): блокировки направлений одной 0x16 (колеса - одной 0x17), глубина
+// очереди движения (setMaxLag), stopMovement(), отсчёты физической мыши (setTracking/physical);
+// квитанции и перенос дожимает сторожевой поток.
 //
 // Происхождение: basics/comport_way/makcu_transport.h (RawComTransport,
 // Format::RawMove, Mode::Async) от 2026-10-10, логика Raw перенесена без
@@ -78,12 +91,14 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace makcu {
@@ -196,6 +211,17 @@ public:
     static constexpr double kStreamCheckUs = 5000000.0;    // проверка, что поток событий включён
     static constexpr double kLinkLostUs = 750000.0;        // плата молчит столько - связь потеряна
     static constexpr double kReconnectRetryUs = 250000.0;  // попытки переподключения
+    static constexpr uint32_t kDefaultMaxLag = 1;          // глубина очереди движения, записей (setMaxLag): замер 2026-10-30
+    static constexpr int32_t kMergeLimit = 2047;           // склейка не больше этого по оси (поле HID >= 12 бит)
+    static constexpr int kTrackScreen = 32767;             // km.screen на время слежения: позиция в центре
+    static constexpr int kTrackCentre = 16383;             //   (km.screen ставит её в середину), запас +-16k
+    static constexpr int kRecentreIdle = 8000;             // дальше от центра - перецентровать, когда мышь стоит
+    static constexpr int kRecentreForce = 14000;           //   дальше - сразу (иначе край обрежет движение)
+    static constexpr int kRecentreStill = 10;              // "стоит": столько одинаковых ответов подряд (5 мс)
+    static constexpr double kTrackPollUs = 500.0;          // опрос позиции: 2 кГц, каждый отчёт мыши отдельно
+    static constexpr double kPosLostUs = 5000.0;           // нет ответа на 0x63 5 мс - потерян
+    static constexpr double kLockSettleUs = 5000.0;        // оси заблокированы (снимок): ещё столько опрашивать
+    static constexpr double kInjectSettleUs = 2000.0;      // запас после очереди платы до первого опроса
 
     // Снимок счётчиков (stats()).
     struct Stats {
@@ -215,6 +241,10 @@ public:
         uint64_t ackSent = 0;
         uint64_t ackRetry = 0;
         uint64_t windowFull = 0;    // move() == false: окно живых записей заполнено
+        uint64_t merged = 0;        // move() прибавлен к следующей записи (очередь >= maxLag)
+        uint64_t carried = 0;       // записей только из переноса, без своего move()
+        uint64_t stopped = 0;       // записей выброшено stopMovement()
+        uint32_t maxLag = 0;        // максимум оценки очереди движения при move()
         uint32_t maxLive = 0;       // живых записей, максимум
         uint32_t window = 0;        // окно этой сессии
         uint32_t lastReason = 0;
@@ -233,7 +263,7 @@ public:
         uint16_t locksWanted = 0;     // блокировки: запрошено
         uint16_t locksOnBoard = 0;    //   по последнему снимку платы
         uint64_t buttonCommands = 0;  // отправлено SET 0x11..0x15
-        uint64_t lockCommands = 0;    // отправлено SET 0x60
+        uint64_t lockCommands = 0;    // отправлено команд блокировки (0x16, 0x17, 0x60)
         uint64_t snapshots = 0;       // снимков 0x56
         uint64_t snapshotLost = 0;    // снимков без ответа
         uint64_t repairs = 0;         // снимок разошёлся с отправленным - команды повторены
@@ -244,6 +274,13 @@ public:
         uint64_t reconnects = 0;      // сколько раз восстановлена
         double lastOutageMs = 0.0;    // длительность последнего обрыва
         uint64_t droppedRecords = 0;  // записей движения сброшено при обрывах
+        // Физическая мышь (setTracking)
+        bool tracking = false;
+        uint64_t posPolls = 0;        // опросов 0x63
+        uint64_t posReplies = 0;      // ответов
+        uint64_t posLost = 0;         // без ответа kPosLostUs
+        uint64_t recentres = 0;       // km.screen заново (позиция ушла далеко от центра)
+        uint64_t clamped = 0;         // ответов с позицией на краю (движение за краем потеряно)
     };
 
     RawTransport() {
@@ -301,11 +338,16 @@ public:
                 std::lock_guard<std::mutex> lock(sendMutex_);
                 (void)writeBlocking(set, sizeof(set));
             }
+            std::lock_guard<std::mutex> tl(trackMutex_);
+            trackOn_ = false;
+            restoreScreenLocked();
         }
         ready_ = false;
         connected_ = false;
         closeHandle();
         streamRestore_.reset();
+        screenRestore_.reset();
+        trackOn_ = false;
         buttonsOk_ = false;
         controlsOk_ = false;
         closing_ = false;
@@ -345,6 +387,63 @@ public:
         return pollButtonsLocked();
     }
 
+    // ---- физическая мышь: позиция платы GET 0x63 --------------------------------------
+    // Плата ведёт позицию по каждому отчёту мыши, который принял ПК: физика плюс наш инжект,
+    // без того, что спрятала блокировка. Пока включено слежение, транспорт опрашивает её
+    // ~2 кГц, ПОКА НЕТ ИНЖЕКТА ДВИЖЕНИЯ, и копит разности - это отсчёты физической мыши.
+    // Замер 2026-10-30: подряд 6.3 кГц, потерь 0, сумма совпадает с Raw Input до отсчёта, между
+    // опросами не больше одного отчёта мыши. Опрос не мешает move(): ответы по COM идут по
+    // порядку, ждать нечего. Инжект: первая же запись move() закрывает отрезок; следующий
+    // начнётся, когда плата отдаст очередь. Под полной блокировкой осей позиция не меняется -
+    // опрос встаёт через kLockSettleUs после подтверждения (утёкшие до блокировки отсчёты учтены).
+    // На время слежения km.screen = 32767x32767, при выключении и в close() - прежний
+    // (km.moveto других программ это заденет).
+    struct Physical {
+        int64_t x = 0;          // отсчёты физической мыши с setTracking(true)
+        int64_t y = 0;
+        uint64_t samples = 0;   // ответов 0x63
+        int64_t sampleQpc = 0;  // когда пришёл последний (QueryPerformanceCounter)
+        bool live = false;      // отрезок идёт: последний ответ засчитан и ему меньше 10 мс
+    };
+    // Включить/выключить слежение. Блокирует на единицы мс (km.screen с проверкой). false - нет связи.
+    bool setTracking(bool on) {
+        std::lock_guard<std::mutex> tl(trackMutex_);
+        if (on == trackOn_.load()) return true;
+        if (!on) {
+            trackOn_ = false;
+            restoreScreenLocked();
+            return true;
+        }
+        if (!healthy()) return false;
+        const auto was = queryScreen();
+        if (!was) return false;
+        screenRestore_ = was;
+        if (!setScreen(kTrackScreen, kTrackScreen)) {
+            screenRestore_.reset();
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> pl(posMutex_);
+            physX_ = physY_ = 0;
+            posSamples_ = 0;
+            posBaseValid_ = false;
+            posStill_ = 0;
+        }
+        trackOn_ = true;
+        return true;
+    }
+    [[nodiscard]] bool tracking() const { return trackOn_.load(); }
+    [[nodiscard]] Physical physical() const {
+        std::lock_guard<std::mutex> pl(posMutex_);
+        Physical r;
+        r.x = physX_;
+        r.y = physY_;
+        r.samples = posSamples_;
+        r.sampleQpc = posSampleT_;
+        r.live = trackOn_.load() && posBaseValid_ && detail::Qpc::now() - posSampleT_ < detail::Qpc::fromUs(10000.0);
+        return r;
+    }
+
     // ---- инжект кнопок (любой поток, не блокируют) -------------------------------------
     // Нажать/отпустить кнопку программно (SET 0x11..0x15). Уходит сразу из вызывающего
     // потока (одна запись WriteFile вместе со снимком-проверкой), движение не ждёт.
@@ -369,23 +468,28 @@ public:
     [[nodiscard]] bool controlsVerified() const { return controlsOk_.load(); }
 
     // ---- блокировки физического ввода (любой поток, не блокируют) ---------------------
-    // Заблокировать/разблокировать физическую кнопку, ось или направление (SET LOCK 0x60).
+    // Заблокировать/разблокировать физическую кнопку, ось или направление.
     // Заблокированное не доходит до ПК от физической мыши; инжект проходит. Проверяется
     // снимком, после переподключения восстанавливается.
     void setLock(LockTarget t, bool locked) { setLocks({t}, locked); }
-    // Несколько целей разом - одной записью в порт (как в UDP-эталоне, где это одна 0x16).
+    // Несколько целей разом: все направления движения из них уйдут ОДНОЙ командой 0x16
+    // (физика встаёт через ~0.15 мс, max 1). setLock(X), затем setLock(Y) - две команды.
     void setLocks(std::initializer_list<LockTarget> targets, bool locked) {
         if (closing_.load()) return;
         uint16_t cur = locksWanted_.load(std::memory_order_acquire);
         for (;;) {
             uint16_t next = cur;
             for (const LockTarget t : targets) next = applyLock(next, t, locked);
-            if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) break;
+            if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) {
+                if ((next ^ cur) & kLockMoveDirs) fullLockT_.store(0, std::memory_order_release);
+                break;
+            }
         }
         kick();
     }
     void unlockAll() {
         locksWanted_.store(0, std::memory_order_release);
+        fullLockT_.store(0, std::memory_order_release);
         kick();
     }
     [[nodiscard]] bool locked(LockTarget t) const { return (locksWanted_.load() & lockBit(t)) != 0; }
@@ -393,9 +497,33 @@ public:
     [[nodiscard]] uint16_t locks() const { return locksWanted_.load(); }
     [[nodiscard]] uint16_t locksOnBoard() const { return boardLocks_.load(); }
 
+    // ---- глубина очереди и остановка инжекта (любой поток) ------------------------------
+    // Всё, что принято move() и ещё не ушло в USB, выходит в ПК по одной записи на отчёт мыши
+    // (1 мс). Это отставание курсора от вызова и хвост после остановки. Часы платы отстают от
+    // QPC (замер: 45 ppm), поэтому при непрерывном движении очередь растёт на запись за ~25 с
+    // и за 60 с хвост дорастает до 3.6 мс, а потолок - окно, 10-12 мс. Если оценка очереди
+    // дошла до maxLag записей, дельта прибавляется к следующей записи: путь точный, отчётов на
+    // один меньше. 0 - не ограничивать (каждый move() - отдельный отчёт).
+    void setMaxLag(uint32_t records) { maxLag_.store(records, std::memory_order_release); }
+    [[nodiscard]] uint32_t maxLag() const { return maxLag_.load(); }
+    // Остановить инжект сейчас: то, что ещё не отправлено плате (перенос), выбрасывается - этот
+    // путь в ПК не попадёт. Записи у платы доиграют (отозвать их нельзя). Возвращает число
+    // выброшенных записей (0 или 1: на COM отправка идёт сразу), в dx/dy - их сумму.
+    uint32_t stopMovement(int32_t* droppedDx = nullptr, int32_t* droppedDy = nullptr) {
+        std::lock_guard<std::mutex> lock(rawMutex_);
+        const uint32_t n = rawCarryX_ != 0 || rawCarryY_ != 0 ? 1u : 0u;
+        if (droppedDx) *droppedDx = static_cast<int32_t>(rawCarryX_);
+        if (droppedDy) *droppedDy = static_cast<int32_t>(rawCarryY_);
+        rawCarryX_ = 0;
+        rawCarryY_ = 0;
+        rawStats_.stopped.fetch_add(n, std::memory_order_relaxed);
+        return n;
+    }
+
     // ---- горячий путь ---------------------------------------------------------
-    // Один целый отчёт. true - принят (уйдёт ровно одним HID-отчётом);
-    // false - сейчас нельзя, оставьте дельту у себя до следующего вызова.
+    // Один целый отчёт. true - принят: отдельной записью (= одним HID-отчётом) или прибавлен
+    // к следующей, если очередь доросла до maxLag. false - сейчас нельзя, оставьте дельту у
+    // себя до следующего вызова.
     [[nodiscard]] bool move(int16_t dx, int16_t dy) {
         if (!healthy()) return false;
         std::lock_guard<std::mutex> lock(sendMutex_);
@@ -454,6 +582,10 @@ public:
         s.ackSent = rawStats_.ackSent.load();
         s.ackRetry = rawStats_.ackRetry.load();
         s.windowFull = rawStats_.windowFull.load();
+        s.merged = rawStats_.merged.load();
+        s.carried = rawStats_.carried.load();
+        s.stopped = rawStats_.stopped.load();
+        s.maxLag = rawStats_.maxLag.load();
         s.maxLive = rawStats_.maxLive.load();
         s.lastReason = rawStats_.lastReason.load();
         s.buttons = mask_.load();
@@ -477,6 +609,15 @@ public:
         s.reconnects = reconnects_.load();
         s.lastOutageMs = lastOutageMs_.load();
         s.droppedRecords = droppedRecords_.load();
+        s.tracking = trackOn_.load();
+        s.posPolls = posPolls_.load();
+        s.posLost = posLost_.load();
+        s.recentres = recentres_.load();
+        {
+            std::lock_guard<std::mutex> pl(posMutex_);
+            s.posReplies = posReplies_;
+            s.clamped = clamped_;
+        }
         std::lock_guard<std::mutex> lock(rawMutex_);
         s.window = rawWindow_;
         s.carryX = rawCarryX_;
@@ -486,24 +627,28 @@ public:
 
     [[nodiscard]] std::string statsLine() const {
         const Stats s = stats();
-        char buf[1400];
+        char buf[1800];
         std::snprintf(buf, sizeof(buf),
             "raw 0x69: отправлено %llu | принято в FIFO %llu | отдано в USB-endpoint %llu | отказ %llu"
             " | немедл. ошибок %llu (нет места %llu) | ack %llu, повторов %llu | окно %u, max живых %u"
-            " | ждали окно %llu | драйвер занят %llu | перенос (%lld,%lld) | посл. причина %u"
+            " | ждали окно %llu | драйвер занят %llu | глубина max %u (предел %u), склеено %llu, из переноса %llu,"
+            " остановкой выброшено %llu | перенос (%lld,%lld) | посл. причина %u"
             " | вызов ср %.1f / max %.1f мкс | ошибок в/в %llu"
             " | кнопки %02X: событий %llu, переполнений %llu, опросов %llu, ответов %llu, изменений %llu"
             " | инжект %02X (плата %02X), команд %llu | блокировки %04X (плата %04X), команд %llu"
             " | снимков %llu (потеряно %llu), исправлено %llu, поток событий включён заново %llu"
-            " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu",
+            " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu"
+            " | физика %s: опросов 0x63 %llu, ответов %llu, потеряно %llu, перецентровок %llu, у края %llu",
             u(s.submitted), u(s.accepted), u(s.endpointOk), u(s.rejected), u(s.immediate), u(s.noCapacity),
-            u(s.ackSent), u(s.ackRetry), s.window, s.maxLive, u(s.windowFull), u(s.driverBusy),
+            u(s.ackSent), u(s.ackRetry), s.window, s.maxLive, u(s.windowFull), u(s.driverBusy), s.maxLag,
+            maxLag_.load(), u(s.merged), u(s.carried), u(s.stopped),
             static_cast<long long>(s.carryX), static_cast<long long>(s.carryY), s.lastReason, s.avgCallUs,
             s.maxCallUs, u(s.errors), s.buttons, u(s.buttonEvents), u(s.buttonOverflows), u(s.buttonPolls),
             u(s.buttonReplies), u(s.buttonChanges), s.injectWanted, s.injectOnBoard, u(s.buttonCommands),
             s.locksWanted, s.locksOnBoard, u(s.lockCommands), u(s.snapshots), u(s.snapshotLost), u(s.repairs),
             u(s.streamRestores), s.connected ? "есть" : "НЕТ", u(s.linkLost), u(s.reconnects), s.lastOutageMs,
-            u(s.droppedRecords));
+            u(s.droppedRecords), s.tracking ? "вкл" : "выкл", u(s.posPolls), u(s.posReplies), u(s.posLost),
+            u(s.recentres), u(s.clamped));
         return buf;
     }
 
@@ -517,11 +662,15 @@ private:
     static constexpr uint8_t kOpDevice = 0x02;
     static constexpr uint8_t kOpFirmware = 0x04;
     static constexpr uint8_t kOpButtonBase = 0x11;     // SET LEFT..SIDE2 0x11..0x15 state:u8 (без ответа)
+    static constexpr uint8_t kOpMoveMask = 0x16;       // SET left:u8 right:u8 down:u8 up:u8 (без ответа) = биты 7 6 9 10
+    static constexpr uint8_t kOpWheelMask = 0x17;      // SET down:u8 up:u8 (без ответа) = биты 13 12
     static constexpr uint8_t kOpInputStream = 0x52;    // GET kind -> enabled; SET kind enabled (без ответа)
     static constexpr uint8_t kOpInputChange = 0x53;    // событие: kind:u8 id:u8 value:u8 (FF FF - переполнение)
     static constexpr uint8_t kOpPhysButtons = 0x55;    // V4.036+: GET -> mask:u8 физических кнопок
     static constexpr uint8_t kOpInjectSnapshot = 0x56; // GET -> 40 байт: [0] инжект-кнопки, [1..2] блокировки
     static constexpr uint8_t kOpLock = 0x60;           // SET target:u8 state:u8 (без ответа)
+    static constexpr uint8_t kOpGetPos = 0x63;         // GET -> x:u16 y:u16 позиция платы (зажата в km.screen)
+    static constexpr uint8_t kOpScreen = 0x64;         // GET -> w:u16 h:u16; SET w h (без ответа): позиция в центр
     static constexpr uint8_t kOpRawMove = 0x69;
     static constexpr uint8_t kOpRawAck = 0x6A;
 
@@ -529,6 +678,8 @@ private:
     // Биты осей целиком (X 5, Y 8, Wheel 11) плата выставляет сама, когда заблокированы оба направления.
     static constexpr uint16_t kLockAll = 0x3FFF;
     static constexpr uint16_t kLockSendable = 0x1F | 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10 | 1u << 12 | 1u << 13;
+    static constexpr uint16_t kLockMoveDirs = 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10;  // +X -X +Y -Y: одна 0x16
+    static constexpr uint16_t kLockWheelDirs = 1u << 12 | 1u << 13;                    // wheel+ wheel-: одна 0x17
     // Снимков в ожидании ответа не больше стольких (кольцо эпох).
     static constexpr uint32_t kSnapRing = 16;
     static constexpr uint32_t kSnapMaxOutstanding = 12;
@@ -644,6 +795,19 @@ private:
         prepareButtons(info, initial);
         prepareControls(info, initial);
         if (initial) info_ = info;
+        if (!initial && trackOn_.load()) {
+            // Плата могла перезагрузиться (размер по умолчанию): km.screen заново, новый отрезок.
+            for (int attempt = 0; attempt < 5; ++attempt) {
+                const auto f = screenFrame(kTrackScreen, kTrackScreen);
+                (void)writeBlocking(f.data(), f.size());
+                const uint8_t q[5] = {0xDE, 0xAD, 0x00, 0x00, kOpScreen};
+                if (auto r = findReply(transact(q, sizeof(q), std::chrono::milliseconds(20)), kOpScreen, 4)) {
+                    if (((*r)[0] | (*r)[1] << 8) == kTrackScreen && ((*r)[2] | (*r)[3] << 8) == kTrackScreen) break;
+                }
+            }
+            posEpoch_.fetch_add(1, std::memory_order_acq_rel);
+            posPending_ = false;
+        }
         return true;
     }
 
@@ -667,18 +831,22 @@ private:
         next_ = 0;
     }
 
-    // Сторожевой поток (тик 2 мс): пульс-снимок, повтор не ушедших команд, обрыв и
-    // переподключение.
+    // Сторожевой поток (тик 2 мс, при слежении 0.5 мс): пульс-снимок, повтор не ушедших
+    // команд, квитанции и перенос, опрос позиции, обрыв и переподключение.
     void watchdogLoop() {
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, kTimerHighResolution, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);  // старая Windows: грубее
         LARGE_INTEGER due{};
-        due.QuadPart = -20000;  // 2 мс, затем период 2 мс
-        if (timer) SetWaitableTimer(timer, &due, 2, nullptr, nullptr, FALSE);
         int64_t nextTry = 0;
         while (!stopWatch_.load()) {
-            if (timer) WaitForSingleObject(timer, 50);
-            else Sleep(2);
+            const bool fast = trackOn_.load(std::memory_order_acquire);
+            if (timer) {
+                due.QuadPart = fast ? -static_cast<LONGLONG>(kTrackPollUs * 10.0) : -20000;  // единицы 100 нс
+                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+                WaitForSingleObject(timer, 50);
+            } else {
+                Sleep(fast ? 1 : 2);
+            }
             if (stopWatch_.load() || closing_.load()) break;
             const int64_t now = detail::Qpc::now();
             if (connected_.load()) {
@@ -688,7 +856,15 @@ private:
                     continue;
                 }
                 std::lock_guard<std::mutex> lock(sendMutex_);
-                if (linkUpLocked()) serviceLocked(now);
+                // Пока вызывающий шлёт, снимки, квитанции и перенос идут из его потока, вплотную к
+                // записи движения (рисунок записей ревизии 3). Сторож подхватывает, когда он замолчал.
+                if (linkUpLocked()) {
+                    if (now - rawLastMoveT_.load(std::memory_order_acquire) > detail::Qpc::fromUs(kRawCallerIdleUs)) {
+                        serviceLocked(now);
+                        (void)moveRaw(0, 0, true);
+                    }
+                    trackLocked(now);
+                }
                 continue;
             }
             if (now < nextTry) continue;
@@ -713,6 +889,7 @@ private:
         closeHandle();  // поток чтения остановлен: счётчики снимков больше никто не трогает
         snapReq_ = 0;
         snapRep_ = 0;
+        posPending_ = false;
         std::lock_guard<std::mutex> lock(rawMutex_);
         uint64_t dropped = rawLive_;
         if (rawCarryX_ != 0 || rawCarryY_ != 0) ++dropped;
@@ -720,6 +897,7 @@ private:
         rawLive_ = 0;
         rawCarryX_ = 0;
         rawCarryY_ = 0;
+        rawLag_ = 0.0;
         for (auto& r : rawRec_) r = RawRecord{};
     }
 
@@ -831,8 +1009,9 @@ private:
         }
     }
 
-    // Под sendMutex_: все различия запрошенного и отправленного - одной записью, кнопки
-    // первыми, в конце снимок 0x56 для проверки. Пауза после команд по COM не нужна.
+    // Под sendMutex_: все различия запрошенного и отправленного - одной записью: кнопки,
+    // все направления движения одной 0x16, колесо одной 0x17, кнопки-блокировки по одной 0x60,
+    // в конце снимок 0x56 для проверки. Пауза после команд по COM не нужна.
     bool sendControlsLocked(int64_t now) {
         const uint8_t wantB = static_cast<uint8_t>(injectWanted_.load(std::memory_order_acquire) & 0x1F);
         const uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
@@ -850,14 +1029,27 @@ private:
             len += sizeof(f);
             ++nb;
         }
-        for (uint8_t i = 0; i < kLockTargetCount; ++i) {
-            if (!(diffL & (1u << i))) continue;
-            const uint8_t f[7] = {0xDE, 0xAD, 0x02, 0x00, kOpLock, i, static_cast<uint8_t>((wantL >> i) & 1u)};
+        auto bit = [wantL](int i) { return static_cast<uint8_t>((wantL >> i) & 1u); };
+        if (diffL & kLockMoveDirs) {
+            const uint8_t f[9] = {0xDE, 0xAD, 0x04, 0x00, kOpMoveMask, bit(7), bit(6), bit(9), bit(10)};  // left=-X right=+X down=+Y up=-Y
             std::memcpy(buf.data() + len, f, sizeof(f));
             len += sizeof(f);
             ++nl;
         }
-        // 5 кнопок x 6 + 11 блокировок x 7 + снимок 5 = 112 <= kFrameMax.
+        if (diffL & kLockWheelDirs) {
+            const uint8_t f[7] = {0xDE, 0xAD, 0x02, 0x00, kOpWheelMask, bit(13), bit(12)};  // down=wheel- up=wheel+
+            std::memcpy(buf.data() + len, f, sizeof(f));
+            len += sizeof(f);
+            ++nl;
+        }
+        for (uint8_t i = 0; i < kMouseButtonCount; ++i) {
+            if (!(diffL & (1u << i))) continue;
+            const uint8_t f[7] = {0xDE, 0xAD, 0x02, 0x00, kOpLock, i, bit(i)};
+            std::memcpy(buf.data() + len, f, sizeof(f));
+            len += sizeof(f);
+            ++nl;
+        }
+        // 5 кнопок x 6 + 0x16 9 + 0x17 7 + 5 блокировок x 7 + снимок 5 = 86 <= kFrameMax.
         ++ctlEpoch_;
         if (!sendSnapshotLocked(now, buf.data(), len)) {
             --ctlEpoch_;
@@ -867,6 +1059,12 @@ private:
         sentLocks_ = normalizeLocks(static_cast<uint16_t>((sentLocks_ & ~kLockSendable) | (wantL & kLockSendable)));
         buttonCommands_.fetch_add(nb, std::memory_order_relaxed);
         lockCommands_.fetch_add(nl, std::memory_order_relaxed);
+        if (nb) {
+            // Нажатие и отпускание - свой отчёт HID (замер: сообщений больше записей ровно на
+            // столько), он занимает слот записи движения.
+            std::lock_guard<std::mutex> lock(rawMutex_);
+            rawLag_ += nb;
+        }
         return true;
     }
 
@@ -896,6 +1094,101 @@ private:
         if (withSnap) snapshots_.fetch_add(1, std::memory_order_relaxed);
         else if (controlsOk_.load()) verifyDue_ = true;
         return true;
+    }
+
+    // Под sendMutex_: опрос позиции 0x63 или перецентровка (слежение включено, инжекта нет).
+    // В полёте один опрос: ответы по COM идут по порядку, а чаще и не нужно.
+    void trackLocked(int64_t now) {
+        if (!trackOn_.load(std::memory_order_acquire)) return;
+        if (posPending_.load(std::memory_order_acquire)) {
+            // Без ответа: позиция на плате копится сама, отсчёты не теряются.
+            if (now - posSentT_ < detail::Qpc::fromUs(kPosLostUs)) return;
+            posLost_.fetch_add(1, std::memory_order_relaxed);
+            posPending_ = false;
+        }
+        {
+            // Инжект: дождаться, пока плата отдаст очередь.
+            std::lock_guard<std::mutex> lock(rawMutex_);
+            if (rawLive_ != 0 || rawCarryX_ != 0 || rawCarryY_ != 0 || now < rawQuietUntil_) return;
+        }
+        // Оси заблокированы целиком, плата подтвердила: физика до ПК не доходит, позиция стоит
+        // (через kLockSettleUs: утёкшие отсчёты уже учтены).
+        const uint16_t want = locksWanted_.load(std::memory_order_acquire);
+        const int64_t lockedT = fullLockT_.load(std::memory_order_acquire);
+        if ((want & kLockMoveDirs) == kLockMoveDirs && lockedT && now - lockedT > detail::Qpc::fromUs(kLockSettleUs)) {
+            return;
+        }
+        std::array<uint8_t, 14> buf{};
+        size_t len = 0;
+        const bool recentre = recentreWanted_.exchange(false, std::memory_order_acq_rel);
+        if (recentre) {
+            // Команда и опрос одной записью: ответ - уже новый отрезок.
+            const auto f = screenFrame(kTrackScreen, kTrackScreen);
+            std::memcpy(buf.data(), f.data(), f.size());
+            len = f.size();
+            posEpoch_.fetch_add(1, std::memory_order_acq_rel);  // позиция в центре: новый отрезок
+        }
+        const uint8_t q[5] = {0xDE, 0xAD, 0x00, 0x00, kOpGetPos};
+        std::memcpy(buf.data() + len, q, sizeof(q));
+        len += sizeof(q);
+        posSentEpoch_.store(posEpoch_.load(std::memory_order_acquire), std::memory_order_release);
+        posSentT_ = now;
+        posPending_.store(true, std::memory_order_release);  // до записи: ответ не должен его опередить
+        if (!sendFrame(buf.data(), len)) {
+            posPending_ = false;
+            if (recentre) recentreWanted_ = true;
+            return;
+        }
+        posPolls_.fetch_add(1, std::memory_order_relaxed);
+        if (recentre) recentres_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // SET km.screen w h: 9 байт кадра.
+    static std::array<uint8_t, 9> screenFrame(int w, int h) {
+        return {0xDE, 0xAD, 0x04, 0x00, kOpScreen, static_cast<uint8_t>(w), static_cast<uint8_t>(w >> 8),
+            static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8)};
+    }
+
+    // GET km.screen в работе: ответ разбирает поток чтения. nullopt - нет ответа или связи.
+    std::optional<std::pair<uint16_t, uint16_t>> queryScreen(const uint8_t* prefix = nullptr, size_t len = 0) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const uint32_t before = screenReplies_.load(std::memory_order_acquire);
+            {
+                std::array<uint8_t, 14> buf{};
+                if (len) std::memcpy(buf.data(), prefix, len);
+                const uint8_t q[5] = {0xDE, 0xAD, 0x00, 0x00, kOpScreen};
+                std::memcpy(buf.data() + len, q, sizeof(q));
+                std::lock_guard<std::mutex> lock(sendMutex_);
+                if (!linkUpLocked()) return std::nullopt;
+                if (!sendFrame(buf.data(), len + sizeof(q))) continue;
+            }
+            const int64_t until = detail::Qpc::now() + detail::Qpc::fromUs(50000.0);
+            while (detail::Qpc::now() < until) {
+                if (screenReplies_.load(std::memory_order_acquire) != before) {
+                    return std::make_pair(screenW_.load(std::memory_order_acquire), screenH_.load(std::memory_order_acquire));
+                }
+                Sleep(1);
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Задать km.screen и проверить: SET изредка теряется. Позиция уходит в центр: новый отрезок.
+    bool setScreen(int w, int h) {
+        posEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            const auto f = screenFrame(w, h);
+            const auto got = queryScreen(f.data(), f.size());
+            if (!got) return false;
+            if (got->first == w && got->second == h) return true;
+        }
+        return false;
+    }
+
+    // Под trackMutex_: вернуть km.screen, каким он был до setTracking(true).
+    void restoreScreenLocked() {
+        if (screenRestore_ && connected_.load()) (void)setScreen(screenRestore_->first, screenRestore_->second);
+        screenRestore_.reset();
     }
 
     bool pollButtonsLocked() {
@@ -960,8 +1253,12 @@ private:
         std::atomic<uint64_t> ackSent{0};
         std::atomic<uint64_t> ackRetry{0};
         std::atomic<uint64_t> windowFull{0};
+        std::atomic<uint64_t> merged{0};
+        std::atomic<uint64_t> carried{0};
+        std::atomic<uint64_t> stopped{0};
         std::atomic<uint32_t> lastReason{0};
         std::atomic<uint32_t> maxLive{0};
+        std::atomic<uint32_t> maxLag{0};
         void reset() {
             submitted = 0;
             accepted = 0;
@@ -972,8 +1269,12 @@ private:
             ackSent = 0;
             ackRetry = 0;
             windowFull = 0;
+            merged = 0;
+            carried = 0;
+            stopped = 0;
             lastReason = 0;
             maxLive = 0;
+            maxLag = 0;
         }
     };
     static constexpr size_t kRawSlots = 64;             // индекс записи = id % 64 (> ёмкости платы 16)
@@ -981,6 +1282,10 @@ private:
     static constexpr double kRawAckAfterUs = 2000.0;    // квитировать не раньше 2 мс после отправки
     static constexpr double kRawAckRetryUs = 1000.0;    // повтор квитирования не чаще раза в 1 мс
     static constexpr double kRawLostReplyUs = 50000.0;  // нет ответа на 0x69 за 50 мс - спросить 0x6A
+    static constexpr double kRawRecordUs = 1000.0;      // плата отдаёт одну запись на отчёт мыши
+    static constexpr double kRawClockDrift = 2e-4;      // запас на отставание часов платы от QPC (замер 45 ppm)
+    static constexpr double kRawIdleLive = 4.0;         // столько живых записей и при пустой очереди (ack через 2-3 мс)
+    static constexpr double kRawCallerIdleUs = 3000.0;  // move() не было столько - вызывающий замолчал (пустые тики - не молчание)
 
     struct RawMeta {
         uint8_t schema = 0;
@@ -1016,6 +1321,7 @@ private:
             rawLive_ = 0;
             rawCarryX_ = 0;
             rawCarryY_ = 0;
+            rawLag_ = 0.0;
             for (auto& r : rawRec_) r = RawRecord{};
             // Окно не больше реально свободных записей платы (с запасом 2).
             rawWindow_ = std::clamp<uint32_t>(meta->freeRecords > 2 ? meta->freeRecords - 2u : 1u, 1u, kRawMaxLive);
@@ -1112,21 +1418,57 @@ private:
         return len;
     }
 
-    // Под sendMutex_. flushOnly: не новая дельта, только квитанции и перенос (service()/finish()).
+    // Под rawMutex_: оценка очереди движения, записей. Квитанции её не показывают (см. шапку),
+    // поэтому счёт по времени: отправлено минус отдано, а отдаётся запись в мс, с запасом на
+    // отставание часов платы. Запас выбран больше реального отставания: истинная очередь
+    // не копится, за него платим склейкой раз в ~5 с непрерывного движения.
+    double lagLocked(int64_t now) {
+        const double done = detail::Qpc::toUs(now - rawLagT_) / kRawRecordUs * (1.0 - kRawClockDrift);
+        rawLag_ = std::max(0.0, rawLag_ - done);
+        rawLagT_ = now;
+        return rawLag_;
+    }
+
+    // Под sendMutex_. flushOnly: не новая дельта, только квитанции и перенос (service()/finish()/сторож).
     bool moveRaw(int16_t dx, int16_t dy, bool flushOnly) {
         if (!rawMode_.load()) return false;
         std::array<uint8_t, kFrameMax> buf{};
         size_t len = 0;
-        bool submitted = false;
+        bool submitted = false, merged = false;
         uint32_t id = 0;
         const int64_t now = detail::Qpc::now();
         {
             std::lock_guard<std::mutex> lock(rawMutex_);
             const bool carry = rawCarryX_ != 0 || rawCarryY_ != 0;
+            const double model = lagLocked(now);
+            // Страховка на случай, когда оценка неверна (очередь заняли отчёты физики и кнопок,
+            // мышь медленнее 1 кГц): живые записи сверх обычных. Только через тик: живые
+            // записи убывают по квитанциям, а квитанции уходят с записью движения.
+            const double sensed = static_cast<double>(rawLive_) - kRawIdleLive;
+            const double lag = std::max(model, sensed);
+            const uint32_t cap = maxLag_.load(std::memory_order_relaxed);
+            const bool full = cap != 0 && (model >= cap || (sensed >= cap && !rawMergedLast_));
+            if (!flushOnly) {
+                rawLastMoveT_.store(now, std::memory_order_release);
+                if (const auto l = static_cast<uint32_t>(lag); l > rawStats_.maxLag.load(std::memory_order_relaxed)) {
+                    rawStats_.maxLag.store(l, std::memory_order_relaxed);
+                }
+                if (full) {
+                    const int64_t nx = rawCarryX_ + dx, ny = rawCarryY_ + dy;
+                    if (std::llabs(nx) <= kMergeLimit && std::llabs(ny) <= kMergeLimit) {
+                        rawCarryX_ = nx;
+                        rawCarryY_ = ny;
+                        rawStats_.merged.fetch_add(1, std::memory_order_relaxed);
+                        merged = true;
+                    }
+                }
+            }
             // Слот следующего id ещё занят зависшей записью - не затирать её
             // (иначе она останется неподтверждённой на плате), ждать как при полном окне.
             const bool slotFree = rawRec_[rawNextId_ % kRawSlots].phase == 0;
-            if ((!flushOnly || carry) && rawLive_ < rawWindow_ && slotFree) {
+            if (merged || (flushOnly && (!carry || full))) {
+                // дельта у следующей записи, или переносу ещё рано
+            } else if (rawLive_ < rawWindow_ && slotFree) {
                 const int64_t x = static_cast<int64_t>(dx) + rawCarryX_;
                 const int64_t y = static_cast<int64_t>(dy) + rawCarryY_;
                 const int64_t cx = std::clamp<int64_t>(x, -32767, 32767);
@@ -1148,12 +1490,17 @@ private:
                     static_cast<uint8_t>(ux >> 8), static_cast<uint8_t>(uy & 0xFF), static_cast<uint8_t>(uy >> 8), 0, 0};
                 len = putRawFrame(buf.data(), kOpRawMove, payload, sizeof(payload));
                 submitted = true;
+                rawQuietUntil_ = now + detail::Qpc::fromUs((rawLag_ + 1.0) * kRawRecordUs + kInjectSettleUs);
+                rawLag_ += 1.0;
             } else if (!flushOnly) {
                 rawStats_.windowFull.fetch_add(1, std::memory_order_relaxed);
             }
-            len = appendAcksLocked(buf.data(), len, now);
+            // Тик со склейкой: в порт ничего, квитанции уйдут со следующей записью.
+            if (!merged) len = appendAcksLocked(buf.data(), len, now);
+            if (!flushOnly) rawMergedLast_ = merged;
         }
-        if (len == 0) return false;
+        if (submitted || merged) posEpoch_.fetch_add(1, std::memory_order_acq_rel);  // инжект: отрезок физики закрыт
+        if (len == 0) return merged;
         if (!sendFrame(buf.data(), len)) {
             if (submitted) {
                 // Запись не ушла: вернуть дельту в перенос и освободить окно.
@@ -1164,13 +1511,17 @@ private:
                     rawCarryY_ += r.dy;
                     r.phase = 0;
                     --rawLive_;
+                    rawLag_ -= 1.0;
                 }
             }
-            return false;
+            return merged;
         }
-        if (submitted) rawStats_.submitted.fetch_add(1, std::memory_order_relaxed);
-        // Новая дельта принята транспортом, только если ушёл новый запрос.
-        return submitted || flushOnly;
+        if (submitted) {
+            rawStats_.submitted.fetch_add(1, std::memory_order_relaxed);
+            if (flushOnly) rawStats_.carried.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Новая дельта принята транспортом, если ушёл новый запрос или она в переносе.
+        return submitted || flushOnly || merged;
     }
 
     // Поток чтения: ответы 0x69/0x6A (длина 6), события и ответы кнопок, снимки.
@@ -1198,6 +1549,12 @@ private:
             } else if (op == kOpPhysButtons && plen == 1) {
                 buttonReplies_.fetch_add(1, std::memory_order_relaxed);
                 applyMask(p[0]);
+            } else if (op == kOpGetPos && plen >= 4) {
+                onPos(p);
+            } else if (op == kOpScreen && plen >= 4) {
+                screenW_.store(static_cast<uint16_t>(p[0] | p[1] << 8), std::memory_order_release);
+                screenH_.store(static_cast<uint16_t>(p[2] | p[3] << 8), std::memory_order_release);
+                screenReplies_.fetch_add(1, std::memory_order_acq_rel);
             } else if (op == kOpInjectSnapshot && plen >= 3) {
                 snapshot = onSnapshot(p) || snapshot;
             } else if (op == kOpInputStream && plen == 1 && streamCheck_.exchange(false, std::memory_order_acq_rel)) {
@@ -1217,10 +1574,44 @@ private:
         const uint64_t epoch = snapReqEpoch_[rep % kSnapRing].load(std::memory_order_relaxed);
         snapRep_.store(rep + 1, std::memory_order_release);
         boardButtons_.store(static_cast<uint8_t>(p[0] & 0x1F), std::memory_order_release);
-        boardLocks_.store(normalizeLocks(static_cast<uint16_t>(p[1] | p[2] << 8)), std::memory_order_release);
+        const uint16_t locks = normalizeLocks(static_cast<uint16_t>(p[1] | p[2] << 8));
+        boardLocks_.store(locks, std::memory_order_release);
+        if ((locks & kLockMoveDirs) == kLockMoveDirs) {
+            int64_t zero = 0;
+            fullLockT_.compare_exchange_strong(zero, detail::Qpc::now(), std::memory_order_acq_rel);
+        } else {
+            fullLockT_.store(0, std::memory_order_release);
+        }
         boardEpoch_.store(epoch, std::memory_order_release);
         snapFresh_.store(true, std::memory_order_release);
         return true;
+    }
+
+    // Поток чтения: позиция 0x63. Разность с прошлым ответом того же отрезка - физика.
+    // Опрос, отправленный до первого move(), ещё без инжекта (запись ушла после него):
+    // его засчитать, а отрезок закрыть. Опоздавший ответ (опрос уже списан) - мимо.
+    void onPos(const uint8_t* p) {
+        if (!posPending_.exchange(false, std::memory_order_acq_rel)) return;
+        const int x = p[0] | p[1] << 8, y = p[2] | p[3] << 8;
+        const uint64_t e = posSentEpoch_.load(std::memory_order_acquire);
+        const int64_t now = detail::Qpc::now();
+        std::lock_guard<std::mutex> pl(posMutex_);
+        ++posReplies_;
+        const bool same = posBaseValid_ && posBaseEpoch_ == e;
+        if (same) {
+            physX_ += x - posLastX_;
+            physY_ += y - posLastY_;
+        }
+        posStill_ = same && x == posLastX_ && y == posLastY_ ? posStill_ + 1 : 0;
+        posLastX_ = x;
+        posLastY_ = y;
+        posSampleT_ = now;
+        ++posSamples_;
+        posBaseEpoch_ = e;
+        posBaseValid_ = e == posEpoch_.load(std::memory_order_acquire);
+        if (x <= 0 || y <= 0 || x >= kTrackScreen - 1 || y >= kTrackScreen - 1) ++clamped_;
+        const int off = std::max(std::abs(x - kTrackCentre), std::abs(y - kTrackCentre));
+        if (off > kRecentreForce || (off > kRecentreIdle && posStill_ >= kRecentreStill)) recentreWanted_ = true;
     }
 
     void onRawReply(uint8_t op, uint8_t state, uint8_t reason, uint32_t id) {
@@ -1409,6 +1800,12 @@ private:
         snapReq_ = 0;
         snapRep_ = 0;
         buttonCommands_ = lockCommands_ = snapshots_ = snapshotLost_ = repairs_ = streamRestores_ = 0;
+        fullLockT_ = 0;
+        posPending_ = false;
+        recentreWanted_ = false;
+        posPolls_ = posLost_ = recentres_ = 0;
+        std::lock_guard<std::mutex> pl(posMutex_);
+        posReplies_ = clamped_ = 0;
     }
 
     void resetLinkStats() {
@@ -1583,6 +1980,12 @@ private:
     uint32_t rawWindow_ = kRawMaxLive;  // по свободным записям платы (prepareRaw)
     int64_t rawCarryX_ = 0;
     int64_t rawCarryY_ = 0;
+    bool rawMergedLast_ = false;        // прошлый тик ушёл в склейку
+    double rawLag_ = 0.0;               // оценка очереди движения, записей (lagLocked)
+    int64_t rawLagT_ = 0;               //   на этот момент
+    int64_t rawQuietUntil_ = 0;         // плата отдаст очередь движения к этому моменту
+    std::atomic<int64_t> rawLastMoveT_{0};  // последний move() с дельтой
+    std::atomic<uint32_t> maxLag_{kDefaultMaxLag};
     std::mutex rawRxMutex_;
     std::vector<uint8_t> rawRx_;  // только поток чтения (и prepareRaw под rawRxMutex_)
     std::atomic<bool> rawMode_{false};
@@ -1620,6 +2023,27 @@ private:
     int64_t nextStreamCheckT_ = 0; // под sendMutex_: проверка потока событий
     std::atomic<uint64_t> buttonCommands_{0}, lockCommands_{0}, snapshots_{0}, snapshotLost_{0}, repairs_{0},
         streamRestores_{0};
+
+    // Физическая мышь (слежение по позиции платы)
+    std::mutex trackMutex_;                          // setTracking/close: km.screen
+    std::optional<std::pair<uint16_t, uint16_t>> screenRestore_;  // под trackMutex_: km.screen до слежения
+    std::atomic<bool> trackOn_{false};
+    std::atomic<uint64_t> posEpoch_{0};              // растёт на move() и перецентровке: отрезок закрыт
+    std::atomic<uint64_t> posSentEpoch_{0};          // posEpoch_ на момент отправки опроса
+    std::atomic<bool> posPending_{false};            // опрос ждёт ответа
+    int64_t posSentT_ = 0;                           // под sendMutex_: когда он ушёл
+    std::atomic<bool> recentreWanted_{false};
+    std::atomic<int64_t> fullLockT_{0};              // снимок впервые показал обе оси заблокированными
+    std::atomic<uint16_t> screenW_{0}, screenH_{0};  // последний ответ GET 0x64
+    std::atomic<uint32_t> screenReplies_{0};
+    std::atomic<uint64_t> posPolls_{0}, posLost_{0}, recentres_{0};
+    mutable std::mutex posMutex_;                    // всё ниже - под ним (пишет поток чтения)
+    int64_t physX_ = 0, physY_ = 0;
+    uint64_t posSamples_ = 0, posReplies_ = 0, clamped_ = 0;
+    int64_t posSampleT_ = 0;
+    int posLastX_ = 0, posLastY_ = 0, posStill_ = 0;
+    bool posBaseValid_ = false;
+    uint64_t posBaseEpoch_ = 0;
 
     // Связь
     std::atomic<bool> connected_{false};

@@ -340,6 +340,7 @@ const MouseButton kAll[] = {MouseButton::Left, MouseButton::Right, MouseButton::
 // ---- режимы ----------------------------------------------------------------------------
 bool runClicks(makcu::RawTransport& tx) {
     std::printf(">>> клики: каждая кнопка 5 раз, удержание 40 мс\n");
+    g_hint = L"НЕ ТРОГАЙТЕ МЫШЬ: кнопки нажимаются программно";
     bool ok = true;
     for (MouseButton b : kAll) {
         const int i = static_cast<int>(b);
@@ -478,8 +479,10 @@ bool runAxes(makcu::RawTransport& tx, double seconds) {
 
 bool runReconnect(makcu::RawTransport& tx, double seconds) {
     tx.setLock(LockTarget::Side2, true);
+    const bool tracking = tx.setTracking(true);  // переподключение возвращает и слежение (km.screen)
     std::printf(">>> переподключение: %.0f с движения по кругу, side2 заблокирована.\n"
                 "    Выдерните кабель USB2 (COM, средний разъём MAKCU) на 3-5 с и вставьте обратно.\n", seconds);
+    g_hint = L"ВЫДЕРНИТЕ USB2 (средний разъём) на 3-5 с и вставьте обратно. Мышь не трогайте";
     Mover mv(tx);
     timeBeginPeriod(1);
     const int64_t period = Q::fromUs(1000.0);
@@ -519,8 +522,13 @@ bool runReconnect(makcu::RawTransport& tx, double seconds) {
     std::printf("  обрывов %llu, переподключений %llu, сброшено записей %llu, блокировки на плате %04X (ждём side2 = 0010), finish %s\n",
         static_cast<unsigned long long>(s.linkLost), static_cast<unsigned long long>(s.reconnects),
         static_cast<unsigned long long>(s.droppedRecords), s.locksOnBoard, finished ? "ok" : "НЕТ");
-    const bool ok = s.linkLost >= 1 && s.reconnects == s.linkLost && s.connected && (s.locksOnBoard & 0x10);
+    const auto ph = tx.physical();
+    std::printf("  слежение: включено %s, идёт %s, опросов 0x63 %llu, ответов %llu, у края %llu\n", tracking ? "да" : "НЕТ",
+        ph.live ? "да" : "НЕТ", static_cast<unsigned long long>(s.posPolls), static_cast<unsigned long long>(s.posReplies),
+        static_cast<unsigned long long>(s.clamped));
+    const bool ok = s.linkLost >= 1 && s.reconnects == s.linkLost && s.connected && (s.locksOnBoard & 0x10) && tracking && ph.live;
     tx.unlockAll();
+    g_hint = nullptr;
     return ok;
 }
 
@@ -589,7 +597,8 @@ bool runWatch(makcu::RawTransport& tx, double seconds) {
 bool runSoak(makcu::RawTransport& tx, int minutes) {
     std::printf(">>> долгий прогон: %d мин. Каждая минута: 35 с движения 1 кГц + клики + блокировки, 20 с простоя,\n"
                 "    5 с движения после простоя. Не трогайте мышь. Ctrl+C - досрочно.\n", minutes);
-    std::printf("  мин | HID Гц | 1 мс %% | путь sent=raw | клики sent/down/up | после простоя мс | отказ raw | исправл | обрывы | память МБ | хэндлы\n");
+    std::printf("  мин | HID Гц | 1 мс %% | путь sent=raw | клики sent/down/up | после простоя мс | отказ raw | исправл | обрывы | память МБ | хэндлы | физ. кнопок | записи-сообщения\n");
+    g_hint = L"НЕ ТРОГАЙТЕ МЫШЬ И КНОПКИ: идёт долгий прогон, кликать не нужно";
     Mover mv(tx);
     timeBeginPeriod(1);
     const int64_t period = Q::fromUs(1000.0);
@@ -601,6 +610,7 @@ bool runSoak(makcu::RawTransport& tx, int minutes) {
     for (int minute = 1; minute <= minutes && !g_stop.load(); ++minute) {
         const int64_t m0 = Q::now();
         const uint64_t mv0 = g_ui.moves.load(), one0 = g_ui.oneMs.load();
+        const uint64_t records0 = tx.stats().submitted;
         int64_t due = Q::now() + period;
         int nextClick = 2000, releaseAt = -1;
         // 0..35 с: движение, клик левой каждые 2 с (удержание 40 мс), остальные кнопки - по разу
@@ -670,19 +680,23 @@ bool runSoak(makcu::RawTransport& tx, int minutes) {
         const bool clicksOk = cd == clicksSent && cu == clicksSent;
         const bool linkOk = s.linkLost == s0.linkLost;
         ok = ok && pathOk && clicksOk && linkOk && resumeMs >= 0.0 && resumeMs < 20.0;
-        std::printf("  %3d | %6.0f | %6.1f | %s (%lld,%lld) | %llu/%u/%u%s | %7.1f | %6llu | %5llu | %4llu | %8.1f | %5lu\n", minute,
+        // Больше 0 - отчёты пропали по дороге (дыра), меньше 0 - лишние отчёты физической мыши.
+        const long long recordsGap = static_cast<long long>(s.submitted - records0) - static_cast<long long>(g_ui.moves.load() - mv0);
+        std::printf("  %3d | %6.0f | %6.1f | %s (%lld,%lld) | %llu/%u/%u%s | %7.1f | %6llu | %5llu | %4llu | %8.1f | %5lu | %llu | %+lld%s\n", minute,
             mvMove / 35.0, mvMove > 1 ? 100.0 * static_cast<double>(oneMove) / static_cast<double>(mvMove - 1) : 0.0,
             pathOk ? "ДА " : "НЕТ", static_cast<long long>(rx - mv.sentX), static_cast<long long>(ry - mv.sentY),
             static_cast<unsigned long long>(clicksSent), cd, cu, clicksOk ? "" : " <--", resumeMs,
             static_cast<unsigned long long>((s.rejected + s.immediate) - (s0.rejected + s0.immediate)),
             static_cast<unsigned long long>(s.repairs - s0.repairs), static_cast<unsigned long long>(s.linkLost - s0.linkLost),
-            mem, static_cast<unsigned long>(hs));
+            mem, static_cast<unsigned long>(hs), static_cast<unsigned long long>(s.buttonEvents - s0.buttonEvents), recordsGap,
+            s.buttonEvents != s0.buttonEvents ? " <-- мышью пользовались, прогон не зачётный" : "");
         std::fflush(stdout);
     }
     timeEndPeriod(1);
     std::printf("  память: %.1f -> %.1f МБ, хэндлы: %lu -> %lu, худшая задержка после простоя %.1f мс\n", mem0, memLast,
         static_cast<unsigned long>(h0), static_cast<unsigned long>(hLast), resumeMax);
     if (memLast - mem0 > 5.0 || hLast > h0 + 20) ok = false;
+    g_hint = nullptr;
     return ok;
 }
 

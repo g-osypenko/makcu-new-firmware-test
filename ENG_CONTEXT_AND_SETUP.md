@@ -58,7 +58,7 @@ Both references (revision 3, same API) also can: **press buttons programmaticall
 themselves** after a drop (UDP — the network, COM — USB2 unplugged) and restore the locks, and
 `open()`/`close()` bring the board to a clean state.
 
-**UDP reference, revision 5 (2026-10-30)** — UDP only so far, COM next:
+**Both references, revision 5 (2026-10-30), the same API** (UDP figures below; COM: tail 0.7–1.6 ms, `stopMovement()` 1.1 ms, `setLocks({X, Y})` 0.42 ms, ~1700 `physical()` counts/s; with a hand moving the mouse during injection the COM tail is 4.5–5.4 ms and the cap does not help):
 - **the cursor stops at once.** The movement queue is capped at 5 records (`setMaxLag`). Without a cap it
   grew, and after 10 s of movement the injection kept going for 8 ms ("freezes 3–4 frames late"). Now the
   tail is 3.6 ms, and `stopMovement()` stops the cursor after 2.7–3.6 ms;
@@ -68,7 +68,7 @@ themselves** after a drop (UDP — the network, COM — USB2 unplugged) and rest
 
 Details and measurements: [`ENG_HANDOFF_MOUSE_TRACKING.md`](ENG_HANDOFF_MOUSE_TRACKING.md).
 
-Verification status as of 2026-10-12:
+COM revision 5 was verified on hardware on 2026-10-30, including `--soak 5`; tables are in the reference README. **Open COM problem:** at 1 kHz a run of reports occasionally vanishes (32 or ~100–113 ms, about once per 2.5 min, in clusters) while the board reports everything as sent, in both revisions; the cause is unknown. Revision 3 status as of 2026-10-12:
 
 | | UDP revision 3 | COM revision 3 |
 | --- | --- | --- |

@@ -132,11 +132,33 @@ counts from when it becomes the queue head.
 `setMaxLag(0)` restores "every `move()` is its own report". With tracking on, polling takes the single
 slot, so the first `move()`/`press()`/`setLocks()` waits for its reply (up to ~2 ms).
 
-**Next:**
-1. **COM**: connect USB2 (COM5) and repeat for COM: the injection tail (`0x69/0x6A`, board queue depth),
-   `0x63` over COM, locks as one `0x16`, `controls_test --axes`. Give the COM reference the same API
-   (`setMaxLag`, `stopMovement`, `setTracking`/`physical`).
-2. Long runs with revision 5 (`controls_test --soak`).
+### COM, revision 5 (2026-10-30): the same over USB2, for different reasons
+
+*Short summary; the full version is in [`HANDOFF_MOUSE_TRACKING.md`](HANDOFF_MOUSE_TRACKING.md), tables in the COM
+reference [`README.md`](basics/comport_way/perfect-transport-comport/README.md).* Bench:
+`basics/comport_way/track_test_com.cpp` with the shared `basics/track_bench.h`.
+
+| | UDP | COM |
+| --- | --- | --- |
+| Tail after 10 s, no cap | 8.0 ms | 1.8 ms (60 s: 3.6 ms) |
+| Why it grows | network stalls | **clock drift**, ~45 ppm, 1 record per ~25 s |
+| Tail with the cap | 3.6–4.3 ms | **0.7–1.6 ms** (`setMaxLag(1)`) |
+| `stopMovement()` | 2.7–3.6 ms | **1.10 ms, max 1.60** |
+| Hand on the mouse during injection | not measured | **4.5–5.4 ms**, the cap does not help |
+| `0x63` back to back | ~509 Hz | **6295 Hz** |
+| `physical()` in the reference | ~475/s | ~1700/s, every mouse report separately |
+| `setLocks({X, Y})` | 1.3 ms, max 2.3 | 0.42 ms, max 0.95 |
+| `SET` losses | 33 of 46 attempts at a 2 ms gap | 0 of 2958 attempts |
+
+Findings: `state 2` comes before delivery (a hidden buffer of ~5 records behind the FIFO, so `0x6A` does not show the
+queue and depth is estimated by time); physical reports take HID slots and the tail saturates at ~5 ms; injected
+button presses take slots too and are now counted (tail with clicks during movement 0.52–1.48 ms).
+
+**Open problem, both revisions:** at 1 kHz a run of reports occasionally vanishes (31.8–32.4 ms or 97.6–112.8 ms) while
+the board reports everything as sent. Revision 3: 2 in ~506 s; revision 5: 10 in ~1530 s, within chance. PC or board: not
+established.
+
+**Next:** find where the reports are lost; the full `controls_test --soak 30`; the hand-on-mouse tail over UDP.
 
 ## What to measure
 

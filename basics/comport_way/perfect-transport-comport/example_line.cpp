@@ -98,12 +98,15 @@ int main(int argc, char** argv) {
     timeEndPeriod(1);
 
     const auto s = tx.stats();
-    std::printf("принято move(): %llu из 2000 тиков | путь отправлен %lld (+ не принято %lld)\n",
-        static_cast<unsigned long long>(accepted), static_cast<long long>(sentX), static_cast<long long>(pendX));
+    std::printf("принято move(): %llu из 2000 тиков | записей %llu, склеено %llu, из переноса %llu | путь отправлен %lld (+ не принято %lld)\n",
+        static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(s.submitted),
+        static_cast<unsigned long long>(s.merged), static_cast<unsigned long long>(s.carried),
+        static_cast<long long>(sentX), static_cast<long long>(pendX));
     std::printf("%s\n", tx.statsLine().c_str());
-    const bool ok = closed && s.submitted == s.endpointOk && s.rejected == 0 && s.immediate == 0 && s.errors == 0 &&
-                    s.carryX == 0 && s.carryY == 0 && pendX == 0;
-    std::printf(ok ? "[+] OK: каждая команда ушла ровно одним HID-отчётом, путь цел\n"
+    // Склейка меняет счёт: принятый move() - это запись или прибавка к следующей записи.
+    const bool ok = closed && s.submitted == s.endpointOk && accepted + s.carried == s.submitted + s.merged &&
+                    s.rejected == 0 && s.immediate == 0 && s.errors == 0 && s.carryX == 0 && s.carryY == 0 && pendX == 0;
+    std::printf(ok ? "[+] OK: каждая запись ушла одним HID-отчётом, склейка сошлась, путь цел\n"
                    : "[-] ЕСТЬ ПОТЕРИ/ОТКАЗЫ - см. строку raw 0x69 выше\n");
     tx.close();
     return ok ? 0 : 1;

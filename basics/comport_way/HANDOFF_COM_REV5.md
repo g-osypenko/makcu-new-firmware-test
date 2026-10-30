@@ -1,5 +1,9 @@
 # Передача: COM-эталон, ревизия 5 (2026-10-30)
 
+> **Сделано 2026-10-30.** Итоги: [`HANDOFF_MOUSE_TRACKING.md`](../../HANDOFF_MOUSE_TRACKING.md), раздел «COM, ревизия 5»,
+> и [`README` эталона](perfect-transport-comport/README.md). Гипотеза ниже про хвост ~12 мс подтвердилась только для
+> минут непрерывного движения: причина на COM — расхождение часов, а не заминки. Файл оставлен как история.
+
 Задача отдельной сессии: довести COM-эталон
 [`perfect-transport-comport/makcu_raw_transport.h`](perfect-transport-comport/makcu_raw_transport.h) до того
 же, что уже сделано в UDP-эталоне ревизий 4–5. Сначала замерить на COM, потом встроить, потом проверить.
