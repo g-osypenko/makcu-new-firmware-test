@@ -25,9 +25,11 @@
 //     а не с 8080, поэтому сокет без connect();
 //   - инжект кнопок: press()/release() - SET 0x11..0x15, первым в цикле (раньше
 //     движения), без тайминга и "хуманизации" (время нажатия задаёт вызывающий);
-//   - блокировки физического ввода: setLock() - SET LOCK 0x60, 14 целей (кнопки, оси,
-//     направления, колесо). Блокировка действует только на физическую мышь: инжект её
-//     обходит, а чтение кнопок (0x53/0x55) видит физику до блокировки;
+//   - блокировки физического ввода: setLock(), 14 целей (кнопки, оси, направления,
+//     колесо). Все направления движения уходят одной SET MOVE_MASK 0x16, колесо - одной
+//     SET WHEEL_MASK 0x17, кнопки - SET LOCK 0x60 (те же биты, что у 0x60). Блокировка
+//     действует только на физическую мышь: инжект её обходит, а чтение кнопок (0x53/0x55)
+//     видит физику до блокировки;
 //   - команды без ответа (кнопки, блокировки) проверяются снимком GET INJECT_SNAPSHOT
 //     0x56: что не применилось (потерялась датаграмма, перезагрузилась плата),
 //     отправляется заново. Снимок же - пульс связи (раз в 250 мс);
@@ -45,7 +47,12 @@
 //   - каждая UDP-команда идёт на второй чип MAKCU по внутреннему каналу, который
 //     везёт одну команду за раз; датаграмма, пришедшая во время передачи, молча
 //     выбрасывается. Поэтому одна команда в полёте и много записей в одной команде;
-//     после команды без ответа - пауза 2 мс (замер: со 1-1.5 мс следующая проходит);
+//     после команды без ответа - пауза 3 мс (замер 2026-10-30: 2 мс хватает, пока мышь
+//     стоит, но сразу после ответа на опрос и с движущейся рукой каждая 4-я команда
+//     из серии терялась; с 3 мс - ни одной);
+//   - блокировка X+Y одной 0x16 (setLocks({X, Y})): физика перестаёт доходить до Windows
+//     через 1.3-2 мс (max 2.5). Четырьмя 0x60 через 2 мс было 7.7 мс (max 12.3) -
+//     направление, заблокированное последним, текло всё это время;
 //   - квитанция сообщает не больше 7 терминальных строк, поэтому пакет <= 7 записей.
 //
 // Контракт вызова:
@@ -58,7 +65,8 @@
 //
 // Ревизия 2026-10-12 (2): чтение кнопок мыши. Ревизия 2026-10-12 (3): инжект кнопок,
 // блокировки, переподключение, сброс состояния при open()/close(). Логика движения
-// не менялась.
+// не менялась. Ревизия 2026-10-30 (4): блокировки направлений движения одной 0x16
+// (колеса - одной 0x17) вместо серии 0x60, пауза после команды без ответа 3 мс.
 //
 // Происхождение: basics/udp_way/makcu_udp_transport.h (RawUdpTransport,
 // Format::Batch) от 2026-10-12. Не править: новая версия - новая папка.
@@ -87,6 +95,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -191,7 +200,7 @@ public:
     static constexpr double kFallbackPollMs = 5.0;        // опрос, если события 0x53 не доходят
     static constexpr uint32_t kMissedForFallback = 2;     // изменений, найденных только опросом
     static constexpr double kPollLostUs = 10000.0;        // нет ответа на опрос/снимок 10 мс - потерян
-    static constexpr double kNoReplyGapUs = 2000.0;       // пауза после команды без ответа
+    static constexpr double kNoReplyGapUs = 3000.0;       // пауза после команды без ответа (2 мс мало, замер 2026-10-30)
     static constexpr double kHeartbeatUs = 250000.0;      // снимок 0x56: сверка кнопок/блокировок + пульс
     static constexpr double kStreamCheckUs = 5000000.0;   // проверка, что поток событий включён
     static constexpr double kLinkLostUs = 750000.0;       // плата молчит столько - связь потеряна
@@ -240,7 +249,7 @@ public:
         uint16_t locksWanted = 0;      // блокировки: запрошено
         uint16_t locksOnBoard = 0;     //   по последнему снимку платы
         uint64_t buttonCommands = 0;   // отправлено SET 0x11..0x15
-        uint64_t lockCommands = 0;     // отправлено SET 0x60
+        uint64_t lockCommands = 0;     // отправлено команд блокировки (0x16, 0x17, 0x60)
         uint64_t snapshots = 0;        // снимков 0x56
         uint64_t snapshotLost = 0;     // снимков без ответа
         uint64_t repairs = 0;          // снимок разошёлся с отправленным - команды повторены
@@ -414,14 +423,18 @@ public:
     [[nodiscard]] uint8_t injectedButtonsOnBoard() const { return boardButtons_.load(); }
 
     // ---- блокировки физического ввода (любой поток, не блокируют) ---------------------
-    // Заблокировать/разблокировать физическую кнопку, ось или направление (SET LOCK 0x60).
+    // Заблокировать/разблокировать физическую кнопку, ось или направление.
     // Заблокированное не доходит до ПК от физической мыши; инжект проходит. Применяется
     // командой цикла, проверяется снимком, после переподключения восстанавливается.
-    void setLock(LockTarget t, bool locked) {
+    void setLock(LockTarget t, bool locked) { setLocks({t}, locked); }
+    // Несколько целей разом: все направления движения из них уйдут ОДНОЙ командой 0x16
+    // (физика встаёт через ~2 мс). setLock(X), затем setLock(Y) - две команды через 3 мс.
+    void setLocks(std::initializer_list<LockTarget> targets, bool locked) {
         if (closing_.load()) return;
         uint16_t cur = locksWanted_.load(std::memory_order_acquire);
         for (;;) {
-            const uint16_t next = applyLock(cur, t, locked);
+            uint16_t next = cur;
+            for (const LockTarget t : targets) next = applyLock(next, t, locked);
             if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) break;
         }
         kick();
@@ -567,6 +580,8 @@ private:
     static constexpr uint8_t kOpInputChange = 0x53;  // событие: kind:u8 id:u8 value:u8 (FF FF - переполнение)
     static constexpr uint8_t kOpPhysButtons = 0x55;  // V4.036+: GET -> mask:u8 физических кнопок
     static constexpr uint8_t kOpInjectSnapshot = 0x56;  // GET -> 40 байт: [0] инжект-кнопки, [1..2] блокировки
+    static constexpr uint8_t kOpMoveMask = 0x16;     // SET left:u8 right:u8 down:u8 up:u8 (без ответа) = биты 7 6 9 10
+    static constexpr uint8_t kOpWheelMask = 0x17;    // SET down:u8 up:u8 (без ответа) = биты 13 12
     static constexpr uint8_t kOpLock = 0x60;         // SET target:u8 state:u8 (без ответа); GET target -> state
     static constexpr uint8_t kOpRawAck = 0x6A;       // 0x6A(id=0): метаданные; (id, consume=1): освободить запись
     static constexpr uint8_t kOpBatch = 0x6C;        // V4.097+: пакет Raw-записей + квитанция
@@ -575,6 +590,8 @@ private:
     // Биты осей целиком (X 5, Y 8, Wheel 11) плата выставляет сама, когда заблокированы оба направления.
     static constexpr uint16_t kLockAll = 0x3FFF;
     static constexpr uint16_t kLockSendable = 0x1F | 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10 | 1u << 12 | 1u << 13;
+    static constexpr uint16_t kLockMoveDirs = 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10;  // +X -X +Y -Y: одна 0x16
+    static constexpr uint16_t kLockWheelDirs = 1u << 12 | 1u << 13;                    // wheel+ wheel-: одна 0x17
 
     static unsigned long long u(uint64_t v) { return static_cast<unsigned long long>(v); }
     static constexpr DWORD kTimerHighResolution = 0x00000002;  // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+)
@@ -1068,7 +1085,9 @@ private:
     }
 
     // Под sendMutex_: одна команда кнопки или блокировки, если запрошенное отличается от
-    // отправленного. Кнопки раньше блокировок. После неё - пауза и сверка снимком.
+    // отправленного. Кнопки раньше блокировок; из блокировок первыми направления движения -
+    // все четыре одной 0x16, затем колесо одной 0x17, затем кнопки по одной 0x60.
+    // После команды - пауза и сверка снимком.
     bool sendControlLocked(int64_t now) {
         const uint8_t wantB = static_cast<uint8_t>(injectWanted_.load(std::memory_order_acquire) & 0x1F);
         if (const uint8_t diff = static_cast<uint8_t>(wantB ^ sentButtons_); diff) {
@@ -1082,11 +1101,22 @@ private:
             const uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
             const uint16_t diffL = static_cast<uint16_t>((wantL ^ sentLocks_) & kLockSendable);
             if (!diffL) return false;
-            uint8_t i = 0;
-            while (!(diffL & (1u << i))) ++i;
-            const uint8_t pl[2] = {i, static_cast<uint8_t>((wantL >> i) & 1u)};
-            if (!sendFrameLocked(++seq_, kOpLock, pl, 2)) return false;
-            sentLocks_ = normalizeLocks(static_cast<uint16_t>(sentLocks_ ^ (1u << i)));
+            auto bit = [wantL](int i) { return static_cast<uint8_t>((wantL >> i) & 1u); };
+            if (diffL & kLockMoveDirs) {
+                const uint8_t pl[4] = {bit(7), bit(6), bit(9), bit(10)};  // left=-X right=+X down=+Y up=-Y
+                if (!sendFrameLocked(++seq_, kOpMoveMask, pl, 4)) return false;
+                sentLocks_ = normalizeLocks(static_cast<uint16_t>((sentLocks_ & ~kLockMoveDirs) | (wantL & kLockMoveDirs)));
+            } else if (diffL & kLockWheelDirs) {
+                const uint8_t pl[2] = {bit(13), bit(12)};  // down=wheel- up=wheel+
+                if (!sendFrameLocked(++seq_, kOpWheelMask, pl, 2)) return false;
+                sentLocks_ = normalizeLocks(static_cast<uint16_t>((sentLocks_ & ~kLockWheelDirs) | (wantL & kLockWheelDirs)));
+            } else {
+                uint8_t i = 0;
+                while (!(diffL & (1u << i))) ++i;
+                const uint8_t pl[2] = {i, bit(i)};
+                if (!sendFrameLocked(++seq_, kOpLock, pl, 2)) return false;
+                sentLocks_ = normalizeLocks(static_cast<uint16_t>(sentLocks_ ^ (1u << i)));
+            }
             lockCommands_.fetch_add(1, std::memory_order_relaxed);
         }
         ++ctlEpoch_;

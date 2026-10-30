@@ -130,7 +130,7 @@ What is used for what:
 | 1000 Hz movement over COM | **`0x69` RAW_MOVE + `0x6A`** | each record = exactly one HID report; over UDP only ~284 Hz (2 datagrams per move) |
 | Movement "the old way" | `0x18` MOVE | goes through the firmware interpolator: ~640–700 Hz over COM, ≤ ~280 commands/s over UDP and no reply |
 | Press/release a button (injection) | SET `0x11…0x15` (LEFT…SIDE2), `1`/`0` | no reply. UDP: pause ≥ 1.5 ms after it; COM: no pause needed, but the command is occasionally lost — verify with a snapshot |
-| Lock physical input | SET `0x60` LOCK `target state` | 14 targets; no reply; the lock does not affect injection or button reading |
+| Lock physical input | SET `0x60` LOCK `target state`; all movement directions at once — SET `0x16` MOVE_MASK `left right down up` (wheel `0x17`) | 14 targets; no reply; the lock does not affect injection or button reading. `0x16` sets the same bits in one command: over UDP physical movement stops after ~1.3 ms (UDP reference revision 4, `setLocks({X, Y})`); a series of `0x60` gave 7.7 ms |
 | Check injection and locks | GET `0x56` INJECT_SNAPSHOT | `[0]` injected buttons, `[1..2]` lock mask |
 | Read physical buttons | **GET `0x55` PHYS_BUTTONS** → mask | bit0 left … bit4 side2 |
 | Button events | `0x52` INPUT_STREAM (enable) → events **`0x53`** | `DE AD 03 00 53 01 <button> <0/1>`; `FF FF` = overflow |
@@ -152,7 +152,9 @@ What is used for what:
 6. **"Enhance pointer precision"** in Windows distorts the cursor path. The movers turn it off while running.
 7. **The COM port is exclusive:** only one program can open it (including the mak-suite SDK).
 8. **Commands without a reply** (buttons `0x11…0x15`, locks `0x60`, `SET 0x52`) over UDP: the next command
-   sooner than ~1 ms later is silently lost. Use a 2 ms pause and verify with a `0x56` snapshot. **Over COM** no pause is needed
+   sooner than ~1 ms later is silently lost. Use a 3 ms pause and verify with a `0x56` snapshot. 2 ms is enough with the mouse
+   still, but after board polling and with a hand on the mouse every 4th command of a series was lost (measured 2026-10-30,
+   `ENG_HANDOFF_MOUSE_TRACKING.md`). **Over COM** no pause is needed
    (SET → SET/GET without a pause 300/300), but the `SET` itself is occasionally lost (0.3–0.7 %, sometimes in bursts) —
    snapshot verification is mandatory there too (a snapshot over COM replies in ~0.3 ms).
 9. **An axis lock is two bits** (+ and −); the whole-axis bit is set by the board itself. Clearing "+X" while the

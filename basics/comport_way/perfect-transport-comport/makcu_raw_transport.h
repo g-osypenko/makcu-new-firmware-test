@@ -79,6 +79,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -371,11 +372,14 @@ public:
     // Заблокировать/разблокировать физическую кнопку, ось или направление (SET LOCK 0x60).
     // Заблокированное не доходит до ПК от физической мыши; инжект проходит. Проверяется
     // снимком, после переподключения восстанавливается.
-    void setLock(LockTarget t, bool locked) {
+    void setLock(LockTarget t, bool locked) { setLocks({t}, locked); }
+    // Несколько целей разом - одной записью в порт (как в UDP-эталоне, где это одна 0x16).
+    void setLocks(std::initializer_list<LockTarget> targets, bool locked) {
         if (closing_.load()) return;
         uint16_t cur = locksWanted_.load(std::memory_order_acquire);
         for (;;) {
-            const uint16_t next = applyLock(cur, t, locked);
+            uint16_t next = cur;
+            for (const LockTarget t : targets) next = applyLock(next, t, locked);
             if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) break;
         }
         kick();

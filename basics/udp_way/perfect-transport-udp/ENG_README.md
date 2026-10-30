@@ -47,6 +47,14 @@ buttons (no timing: the hold time is set by the caller), locks of physical input
 recovery, state reset on `open()` and `close()`. The movement logic did not change (the movement self-check
 after the change: 2000 of 2000, 99.7–99.8 % of intervals at 1 ms).
 
+**Revision 2026-10-30 (4): fast axis locks.** Movement directions go out as one `SET MOVE_MASK 0x16`
+command (the wheel as one `0x17`) instead of a series of `0x60`. Added `setLocks({X, Y}, on)`: several
+targets in one call. The pause after a command without a reply is 3 ms instead of 2. Measured with a hand
+on the mouse: physical movement stops reaching Windows after **1.3 ms median, max 2.3**
+(`setLocks({X, Y})`). It used to be 7.7 ms, max 12.3: four `0x60` 2 ms apart, and with board polling
+before the lock every 4th command was lost until the snapshot repaired it. The movement logic did not
+change.
+
 **Difference from the mover:** if the queue is full (7 records), `move()` returns `false` and the delta stays with
 the caller. In the mover the records are merged in this case. This keeps the contract "one accepted `move()`
 = exactly one HID report". With a real RTT of ~1.9 ms the queue has no more than 3–4 records, so
@@ -97,6 +105,7 @@ tx.press(makcu::MouseButton::Left);             // press; the hold is on your si
 tx.release(makcu::MouseButton::Left);           // release
 tx.setLock(makcu::LockTarget::Side2, true);     // side2 no longer reaches the game, but buttons() sees it
 tx.setLock(makcu::LockTarget::X, true);         // the physical mouse's X axis (both directions)
+tx.setLocks({makcu::LockTarget::X, makcu::LockTarget::Y}, true);  // both axes in ONE command: ~2 ms
 tx.unlockAll();                                 // clear all locks
 if (!tx.connected()) { /* the link is lost, the transport reconnects by itself */ }
 ```
@@ -115,7 +124,7 @@ if (!tx.connected()) { /* the link is lost, the transport reconnects by itself *
 | `setButtonPollMs(ms)` | the interval of the safety `0x55` poll, 50 ms by default; `0` turns the poll off entirely. Without events the poll itself runs no less often than every 5 ms |
 | `press(b)` / `release(b)` / `setButtonState(b, down)` / `releaseAllButtons()` | button injection (`SET 0x11…0x15`). Goes out as the next command of the loop, **ahead of movement** from the queue: it waits only for the command already in flight. Measured: from `press()` to the event in Windows 1.3–1.55 ms on average, max 1.87 ms. Injection is added to the physical state (OR): releasing a physical button does not cancel a software press |
 | `injectedButtons()` / `injectedButtonsOnBoard()` | the requested mask of injected buttons / what is on the board per the last snapshot (up to 250 ms ago) |
-| `setLock(t, on)` / `unlockAll()` / `locked(t)` / `locks()` / `locksOnBoard()` | physical input lock (`SET LOCK 0x60`): 5 buttons, the X/Y axes and the wheel as a whole or per direction. What is locked does not reach the PC from the physical mouse; injection passes; `buttons()` sees the physical state even for a locked button |
+| `setLock(t, on)` / `setLocks({t…}, on)` / `unlockAll()` / `locked(t)` / `locks()` / `locksOnBoard()` | physical input lock: 5 buttons, the X/Y axes and the wheel as a whole or per direction. Movement directions go as one `SET 0x16`, the wheel as one `0x17`, buttons as `SET 0x60`. What is locked does not reach the PC from the physical mouse; injection passes; `buttons()` sees the physical state even for a locked button. **Lock both axes with `setLocks({X, Y}, on)`**: one command, physical movement stops after ~1.3 ms (max 2.3). Two `setLock` calls in a row are two commands 3 ms apart (4.3 ms, max 5) |
 | `connected()` | there is a link to the board. `false` — a reconnect is in progress, `move()` returns `false` |
 | `open()` | additionally: enables the event stream, brings the board to a clean state — clears injected buttons and locks left over from a crashed program |
 | `close()` | releases all injected buttons, clears all locks (confirmed with a snapshot), returns the `INPUT_STREAM mouse` stream to its state before `open()` |
@@ -190,10 +199,15 @@ With a 5 ms poll the packets get denser (~3 records instead of ~1.9), and 1000 H
 
 ## Button injection and locks
 
-The board's commands `SET 0x11…0x15` (buttons) and `SET 0x60` (locks) are **without a reply**. This means:
+The board's commands `SET 0x11…0x15` (buttons), `SET 0x16`/`0x17` (movement and wheel masks) and
+`SET 0x60` (locks) are **without a reply**. This means:
 
-- **a 2 ms pause after each such command.** Measured: a next command that arrives sooner than
-  ~1 ms later is silently lost (a transfer to the second chip is in progress); with 1.5 ms 40 of 40 pass;
+- **a 3 ms pause after each such command.** Measured 2026-10-12: a next command sooner than ~1 ms later
+  is silently lost (a transfer to the second chip is in progress), with 1.5 ms 40 of 40 pass — but with the
+  mouse still. Measured 2026-10-30: when board polling came right before the series and a hand was moving
+  the mouse, with a 2 ms pause one of four `0x60` was lost in 33 of 46 attempts. With 3 and 4 ms pauses
+  0 of 46 were lost, a single `0x16` 0 of 45. Without polling before the series nothing is lost even at
+  2 ms (620 of 620);
 - **verification with the `GET 0x56 INJECT_SNAPSHOT` snapshot** (40 bytes: `[0]` injected buttons, `[1..2]` lock
   mask, bit = target number) right after the commands and once per 250 ms. If the board does not have what was
   sent (a datagram was lost, the board was rebooted, another program interfered), the transport
@@ -207,6 +221,25 @@ press shorter than a loop round trip, hold the button for at least a few millise
 is set by the board itself when both directions are locked. Measured: "+X, then −X" → `{X,+X,−X}`;
 "X, then clear +X" → `{−X}`. So `setLock(X, on)` sets or clears both directions, and
 `setLock(XPos, false)` on a locked axis leaves only −X.
+
+**Locking movement with one command.** `SET MOVE_MASK 0x16 left right down up` is the same state as the
+`0x60` targets ("a lock is the same state as the matching mask"). Checked with the snapshot: left → −X
+(bit 7), right → +X (6), down → +Y (9), up → −Y (10), all four → `07E0` including the whole-axis bits.
+`0x16 0000` also clears what was set through `0x60`. Wheel: `0x17 down up` → bits 13, 12. The transport
+sends all four directions as one `0x16` as soon as any of them changes.
+
+Lock delay, `probes/track_test.exe --reflock 20` (2026-10-30, a hand moving in circles; from the call to
+the last physical count in Windows Raw Input):
+
+| How | Median | Max | Leak (counts) |
+| --- | --- | --- | --- |
+| revision 3: `setLock(X)` + `setLock(Y)` = four `0x60` 2 ms apart | 7.65 ms | 12.3 ms | 3–23 |
+| revision 4: `setLock(X)` + `setLock(Y)` = two `0x16` 3 ms apart | 4.3 ms | 5.0 ms | 1–14 |
+| revision 4: `setLocks({X, Y})` = one `0x16` | **1.3 ms** | **2.3 ms** | 0–11 |
+
+It cannot go below ~1–2 ms: the command travels to the second chip, plus the next mouse report. Windows
+did receive the leaked counts, and the board position `0x63` sees them too. The board position does not
+count movement under a lock: 0 counts over 400 ms with a hand on the mouse.
 
 ## Reconnect
 
@@ -248,6 +281,8 @@ Install a Ctrl+C and console-close handler that calls `close()`.
 | revision 3, `controls_test`: clicks / locks / cable drop | clicks 25/25, press()→Windows 1.3–1.55 ms (max 1.87); locked middle/side1/side2: the transport saw 13/7/11 presses, Windows 0; cable unplugged → the link returned by itself after 14.3 s, the lock was in place |
 | revision 3, `controls_test --axes 10` (2026-10-12, the owner moved the mouse) | axis locks work: X, Y, only +X, only −Y — **0 counts** in the locked direction, the free ones — thousands; with no locks everything passes. During active physical mouse movement 33 of 1041 `0x55` polls and 5 of 216 snapshots were lost (they repeat by themselves, no effect on the result) |
 | revision 3, `controls_test --soak 30` (2026-10-12) | minutes 1–2: HID 998–999 Hz, 99.8–99.9 % at 1 ms, exact path, clicks 34/34/34, after 20 s idle the first report in 1.0–1.8 ms, memory a stable 2 MB. In minute 3 the board's USB3 "went silent" (network and mouse vanished, only reconnecting the board helped) — the symptom that the test build V4.098 fixes; the transport correctly waited for the link |
+| revision 4, `controls_test --axes 5` and `--clicks` (2026-10-30, the owner moved the mouse) | X, Y, only +X, only −Y — **0 counts** in the locked direction, 8 lock commands instead of 12; clicks 25/25, press()→Windows avg 1.6–2.8 ms (max 4.0); link `--check` fine |
+| revision 4, `probes/track_test.exe --reflock 20` | locking both axes with `setLocks({X, Y})`: physical movement stops after 1.3 ms (max 2.3), see "Button injection and locks" |
 | movement + buttons (revision 2), 5 ms poll | 2000 = 2000, 99.3–99.9 % of intervals at 1 ms, polls with no losses |
 | `0x53` events over UDP, `udp_buttons_any.py` (Python with the firewall rule) | 91–147 events per 8 s phase with presses, match the `0x55` poll |
 | buttons, `example_line.exe --buttons 15` (no rule, network Public) | events 0 (the firewall drops them), the transport itself switched to the 5 ms poll: all 5 buttons, presses left 17 / right 9 / middle 20 / side1 16 / side2 19 |
@@ -297,8 +332,11 @@ from byte 14. One command per datagram.
 - `SET LOCK 0x60`: `target:u8 state:u8`, **no reply**; `GET LOCK 0x60 target:u8` → `state:u8`. Targets:
   0 left, 1 right, 2 middle, 3 side1, 4 side2, 5 X, 6 +X, 7 −X, 8 Y, 9 +Y, 10 −Y, 11 wheel, 12 wheel+,
   13 wheel−. A lock acts only on the physical state; injection bypasses it.
+- `SET MOVE_MASK 0x16`: `left:u8 right:u8 down:u8 up:u8`, **no reply** — the same bits 7, 6, 9, 10 as
+  `0x60`, in one command. `SET WHEEL_MASK 0x17`: `down:u8 up:u8` → bits 13, 12.
 - `GET 0x56 INJECT_SNAPSHOT` (V4.036+): 40 bytes; `[0]` injected buttons (bit0…4), `[1..2]` locks u16.
-- After a command without a reply the next one passes at ≥ 1–1.5 ms (measured 2026-10-12).
+- After a command without a reply the next one passes at ≥ 1–1.5 ms with the mouse still (2026-10-12), but
+  after a poll and with a hand on the mouse 2 ms is sometimes not enough (2026-10-30). The transport waits 3 ms.
 - `0x52 INPUT_STREAM`: `GET kind:u8` → `enabled:u8`; `SET kind:u8 enabled:u8` (no reply). kind 1 = mouse.
 - `0x53 INPUT_CHANGE` (unsolicited): `kind:u8 id:u8 value:u8`, for the mouse id = button 0…4, value 0/1;
   `kind FF FF` = overflow. Over UDP it arrives with the source port equal to the client's port.
