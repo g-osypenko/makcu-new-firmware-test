@@ -55,6 +55,20 @@ on the mouse: physical movement stops reaching Windows after **1.3 ms median, ma
 before the lock every 4th command was lost until the snapshot repaired it. The movement logic did not
 change.
 
+**Revision 2026-10-30 (5): the cursor stops at once, and live-mouse counts.**
+- **Movement queue depth** `setMaxLag(n)`, default 5 records. The board hands the PC one record per mouse
+  report, exactly as many as we send, so every network hiccup left a record in the queue for good: after
+  10 s of movement the tail after the last `move()` grew to **8 ms** (the "3–4 frames late" stop of the
+  injection). Now, once the queue reaches 5 records, a new delta is added to the last unsent record: the
+  path is exact, the tail is **3.6 ms**, ~3 % of reports are merged (HID ~945 Hz, 97–98 % of intervals at
+  1 ms). `setMaxLag(0)` restores the old behaviour.
+- **`stopMovement()`**: "freeze now". Unsent records are dropped, only what the board already has plays
+  out. The cursor stops after **2.7–3.6 ms** (3 reports).
+- **Live-mouse counts** `setTracking(true)` / `physical()`. While there is no movement injection the
+  transport polls the board position `GET 0x63` in free slots (~475 per second) and accumulates the
+  differences. The sum matches Raw Input to the count; injection never gets in (8 one-second bursts with
+  the mouse still: 0,0).
+
 **Difference from the mover:** if the queue is full (7 records), `move()` returns `false` and the delta stays with
 the caller. In the mover the records are merged in this case. This keeps the contract "one accepted `move()`
 = exactly one HID report". With a real RTT of ~1.9 ms the queue has no more than 3–4 records, so
@@ -124,6 +138,9 @@ if (!tx.connected()) { /* the link is lost, the transport reconnects by itself *
 | `setButtonPollMs(ms)` | the interval of the safety `0x55` poll, 50 ms by default; `0` turns the poll off entirely. Without events the poll itself runs no less often than every 5 ms |
 | `press(b)` / `release(b)` / `setButtonState(b, down)` / `releaseAllButtons()` | button injection (`SET 0x11…0x15`). Goes out as the next command of the loop, **ahead of movement** from the queue: it waits only for the command already in flight. Measured: from `press()` to the event in Windows 1.3–1.55 ms on average, max 1.87 ms. Injection is added to the physical state (OR): releasing a physical button does not cancel a software press |
 | `injectedButtons()` / `injectedButtonsOnBoard()` | the requested mask of injected buttons / what is on the board per the last snapshot (up to 250 ms ago) |
+| `setMaxLag(n)` / `maxLag()` | movement queue depth in records; default 5, `0` = no limit (as before revision 5). The cursor lag behind `move()` and the tail after stopping are ≈ `n` ms. Measured: with no limit the tail grows to 8 ms over 10 s, with 5 it is 3.6 ms, ~3 % merged |
+| `stopMovement(&dx, &dy)` | "freeze": records not yet sent to the board are dropped (their sum goes to `dx`/`dy`); the packet in flight and the board queue play out (cannot be recalled). The cursor stops after 2.7–3.6 ms |
+| `setTracking(on)` / `tracking()` / `physical()` | live-mouse counts from the board position `GET 0x63`. Polled in free loop slots **only while there is no movement injection**; under a full axis lock it stops 5 ms after confirmation (the position does not change there). `physical()`: `x`, `y` accumulated since `setTracking(true)`, `samples`, `sampleQpc`, `live`. The first `move()` closes the segment, the next starts ~8 ms after the last `move()` (the board drains its queue). Polling takes the single slot: `move()`/`press()`/`setLocks()` wait for its reply (up to ~2 ms). While tracking, `km.screen` = 32767×32767 (±16k counts, re-centred when the mouse is still), restored afterwards. `setTracking(true)` blocks up to ~0.3 s |
 | `setLock(t, on)` / `setLocks({t…}, on)` / `unlockAll()` / `locked(t)` / `locks()` / `locksOnBoard()` | physical input lock: 5 buttons, the X/Y axes and the wheel as a whole or per direction. Movement directions go as one `SET 0x16`, the wheel as one `0x17`, buttons as `SET 0x60`. What is locked does not reach the PC from the physical mouse; injection passes; `buttons()` sees the physical state even for a locked button. **Lock both axes with `setLocks({X, Y}, on)`**: one command, physical movement stops after ~1.3 ms (max 2.3). Two `setLock` calls in a row are two commands 3 ms apart (4.3 ms, max 5) |
 | `connected()` | there is a link to the board. `false` — a reconnect is in progress, `move()` returns `false` |
 | `open()` | additionally: enables the event stream, brings the board to a clean state — clears injected buttons and locks left over from a crashed program |
@@ -283,6 +300,12 @@ Install a Ctrl+C and console-close handler that calls `close()`.
 | revision 3, `controls_test --soak 30` (2026-10-12) | minutes 1–2: HID 998–999 Hz, 99.8–99.9 % at 1 ms, exact path, clicks 34/34/34, after 20 s idle the first report in 1.0–1.8 ms, memory a stable 2 MB. In minute 3 the board's USB3 "went silent" (network and mouse vanished, only reconnecting the board helped) — the symptom that the test build V4.098 fixes; the transport correctly waited for the link |
 | revision 4, `controls_test --axes 5` and `--clicks` (2026-10-30, the owner moved the mouse) | X, Y, only +X, only −Y — **0 counts** in the locked direction, 8 lock commands instead of 12; clicks 25/25, press()→Windows avg 1.6–2.8 ms (max 4.0); link `--check` fine |
 | revision 4, `probes/track_test.exe --reflock 20` | locking both axes with `setLocks({X, Y})`: physical movement stops after 1.3 ms (max 2.3), see "Button injection and locks" |
+| revision 5, `track_test --inject ... --lag 0` (2026-10-30, hands off) | with no queue limit the tail after the last `move()`: 0.3 s run 5.9 ms, 1 s 6.0, 3 s 7.2, **10 s 8.0 ms** — the queue only grows |
+| revision 5, `--lag 0,2,3,4,5,6` sweep | tail / 1 ms intervals: none 6.1–8.1 ms / 99.9 %; 6 — 4.7–5.7 / 98.4 %; **5 — 3.6–4.3 / 97–97.5 %**; 4 — 3.5 / 83 %; 2–3 — 3.2–3.4 / 23–61 %. ~3.2 ms is the floor |
+| revision 5, `--stop` | `stopMovement()`: with limit 5 the cursor stops after **2.7–3.6 ms**, with no limit 4.8–6.9 ms |
+| revision 5, `--trackinject 8` (hands off) | tracking on, 8 one-second injection bursts: `physical()` **0,0** in all; tracking resumes 7.3–8.3 ms after the last `move()` |
+| revision 5, `--track 20` (the owner moved the mouse, 11 locks of 0.4 s) | 7411 `physical()` samples, 0 polls lost; each matched Raw Input to within the neighbouring report, **total discrepancy 0,0** |
+| revision 5, `example_line.exe` | 2000 of 2000 `move()` accepted, path 0, 1931 HID reports (69 merged), ~944 Hz, 98.0 % at 1 ms |
 | movement + buttons (revision 2), 5 ms poll | 2000 = 2000, 99.3–99.9 % of intervals at 1 ms, polls with no losses |
 | `0x53` events over UDP, `udp_buttons_any.py` (Python with the firewall rule) | 91–147 events per 8 s phase with presses, match the `0x55` poll |
 | buttons, `example_line.exe --buttons 15` (no rule, network Public) | events 0 (the firewall drops them), the transport itself switched to the 5 ms poll: all 5 buttons, presses left 17 / right 9 / middle 20 / side1 16 / side2 19 |

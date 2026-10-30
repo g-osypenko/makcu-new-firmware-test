@@ -56,12 +56,15 @@ transports. Project overview: `ENG_CONTEXT_AND_SETUP.md` (read first).
 
 ## Results 2026-10-30 (UDP, board V4.097)
 
-**The owner's answers:**
-- what is needed is physical mouse counts **before a lock starts**; during a lock or injection the position
-  is not needed;
+**The owner's answers** (clarified in a second conversation the same day):
+- what is needed is polling of the live mouse **when there is no injection**; during injection or a lock the
+  position is not needed;
 - the main thing is a fairly accurate count, ideally every report;
 - PC-side Raw Input/hooks only in tests, in production everything goes through the board;
-- check why movement is cut off 3–4 frames late.
+- "3–4 frames" is the **stop of the injection**: the program tells MAKCU to freeze and the cursor keeps
+  moving for 3–4 frames. I first misread it as the physical lock (revision 4 below), but that delay was also
+  8–12 ms, so the fix stayed useful;
+- finish UDP first, then COM.
 
 Rig: `basics/udp_way/probes/track_test.cpp` (build line in the file header). A test window with Raw Input
 in focus, its own UDP link to the board (one command in flight) or the reference transport.
@@ -95,17 +98,45 @@ The COM reference only got `setLocks` for the same API (compiles, not tested on 
 - The position includes our injection. Right after injecting, tail reports keep coming for up to ~6 ms
   (measurement 3): wait for them or subtract them by `move()`.
 
+### UDP, revision 5 (2026-10-30): the cursor stops at once, live-mouse counts in the reference
+
+**Why the injection stops late.** The board sends the PC one Raw record per mouse report (1 ms) and the
+program sends one per 1 ms too. Once the queue has grown (a network hiccup, a late receipt) it never
+shrinks. The tail after the last `move()` grows with the length of the movement: 0.3 s — 5.9 ms, 1 s —
+6.0, 3 s — 7.2, **10 s — 8.0 ms (8–9 reports)**. That is the 3–4 frames at 400–500 fps. Records cannot be
+recalled from the board (no cancel in `makcu.com/api/raw-v4074.md`); a record's `timeout_uf`/`dt` only
+counts from when it becomes the queue head.
+
+**Done** (`makcu_udp_batch_transport.h`, revision 5):
+- **queue depth** `setMaxLag(n)`, default 5. Queue estimate = board queue from the receipt (`[10]`) minus
+  what has gone out since (1/ms) + the packet in flight + unsent records. When it reaches `n`, a new delta
+  is added to the last unsent record: exact path, one report fewer;
+- **`stopMovement()`**: "freeze" — unsent records are dropped;
+- **`setTracking(true)` / `physical()`**: live-mouse counts from `0x63` polled while there is no movement
+  injection. The first `move()` closes the segment (a poll sent before it still counts); a new segment
+  starts once the board has drained (receipt + its queue in ms + 2 ms). Under a full axis lock polling stops
+  5 ms after the snapshot confirms it. `km.screen` = 32767×32767, re-centred when the position is 8000 from
+  the centre and the mouse is still (14000 — at once);
+- `example_line`: the check is "records + merged = accepted `move()`".
+
+| Measurement (`probes/track_test.exe`) | Result |
+| --- | --- |
+| `--inject 2 --dur 3000 --lag 0,2,3,4,5,6` | tail / 1 ms intervals / merged: none 6.1–7.2 ms / 99.9 % / 0; 6 — 4.7–5.7 / 98.4 % / 1.5 %; **5 — 3.6 / 97.5 % / 3.5 %**; 4 — 3.5 / 83 % / 16 %; 2–3 — 3.2–3.4 / 23–61 %. ~3.2 ms is the floor |
+| `--inject 2 --dur 10000 --lag 0,5` | 10 s of movement: none 7.9–8.1 ms, 5 — **3.6–4.3 ms** |
+| `--inject 3 --dur 3000 --lag 5,0 --stop` | **`stopMovement()` stops the cursor after 2.7–3.6 ms** with limit 5, 4.8–6.9 ms without |
+| `--trackinject 8` (hands off) | 8 one-second bursts (−179,+106 each): `physical()` **0,0 in all**; tracking resumes 7.3–8.3 ms after the last `move()` |
+| `--track 20` (a hand, 11 locks of both axes for 0.4 s) | 7411 samples (~475/s outside locks), 0 polls lost, each matched Raw Input to within the neighbouring report, **total discrepancy 0,0** |
+| `example_line.exe` | 2000/2000 `move()`, path 0, 1931 HID reports (69 merged), ~944 Hz, 98.0 % at 1 ms |
+
+**Cost:** HID ~945 Hz instead of ~995 (3 % of reports carry two deltas), the path is unchanged.
+`setMaxLag(0)` restores "every `move()` is its own report". With tracking on, polling takes the single
+slot, so the first `move()`/`press()`/`setLocks()` waits for its reply (up to ~2 ms).
+
 **Next:**
-1. Build position reading into the UDP reference:
-   - poll `0x63` in free slots while there is no movement and no lock;
-   - accumulated counts in int64;
-   - `km.screen` 32767×32767, re-centred under a lock;
-   - decide with the owner whether it is turned on by a separate flag. Polling takes the single slot, so
-     the first `move()`/`setLocks()` waits up to ~2 ms.
-2. COM: connect USB2, repeat the measurements (`0x63` over COM), switch locks to `0x16`, run
-   `controls_test --axes`.
-3. The 5.7 ms injection tail: if it matters, look at the queue depth (merging records on stop, the `dt`
-   field of `0x6C`).
+1. **COM**: connect USB2 (COM5) and repeat for COM: the injection tail (`0x69/0x6A`, board queue depth),
+   `0x63` over COM, locks as one `0x16`, `controls_test --axes`. Give the COM reference the same API
+   (`setMaxLag`, `stopMovement`, `setTracking`/`physical`).
+2. Long runs with revision 5 (`controls_test --soak`).
 
 ## What to measure
 

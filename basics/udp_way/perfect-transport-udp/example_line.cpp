@@ -156,7 +156,9 @@ int main(int argc, char** argv) {
     std::printf("HID (LL-хук): %llu отчётов, ~%.0f Гц, интервалов ~1 мс %.1f %%\n", static_cast<unsigned long long>(hid),
         static_cast<double>(hid) / runS, hid > 1 ? 100.0 * static_cast<double>(g_oneMs.load()) / static_cast<double>(hid - 1) : 0.0);
     std::printf("%s\n", tx.statsLine().c_str());
-    const bool ok = closed && s.records == accepted && s.admitted == s.records && s.termRejected == 0 &&
+    std::printf("склеено move() с последней неотправленной записью (очередь >= maxLag %u): %llu\n", tx.maxLag(),
+        static_cast<unsigned long long>(s.merged));
+    const bool ok = closed && s.records + s.merged == accepted && s.admitted == s.records && s.termRejected == 0 &&
                     s.envelope == 0 && s.badReplies == 0 && s.pending == 0 && !s.inFlight && pendX == 0;
     std::printf(ok ? "[+] OK: каждая запись принята платой и ушла одним HID-отчётом, плата чистая\n"
                    : "[-] ЕСТЬ ПОТЕРИ/ОТКАЗЫ - см. строку batch 0x6C выше\n");

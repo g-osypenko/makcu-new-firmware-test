@@ -58,6 +58,16 @@ Both references (revision 3, same API) also can: **press buttons programmaticall
 themselves** after a drop (UDP — the network, COM — USB2 unplugged) and restore the locks, and
 `open()`/`close()` bring the board to a clean state.
 
+**UDP reference, revision 5 (2026-10-30)** — UDP only so far, COM next:
+- **the cursor stops at once.** The movement queue is capped at 5 records (`setMaxLag`). Without a cap it
+  grew, and after 10 s of movement the injection kept going for 8 ms ("freezes 3–4 frames late"). Now the
+  tail is 3.6 ms, and `stopMovement()` stops the cursor after 2.7–3.6 ms;
+- **both axes locked with one command** `0x16` (`setLocks({X, Y})`): physical movement stops after 1.3 ms;
+- **live-mouse counts** `setTracking`/`physical()`: the board position `0x63` while there is no injection.
+  The sum matches Raw Input to the count.
+
+Details and measurements: [`ENG_HANDOFF_MOUSE_TRACKING.md`](ENG_HANDOFF_MOUSE_TRACKING.md).
+
 Verification status as of 2026-10-12:
 
 | | UDP revision 3 | COM revision 3 |

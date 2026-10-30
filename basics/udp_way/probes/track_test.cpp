@@ -15,12 +15,16 @@
 //                    снимком 0x56: сколько команд дошло, отдельно - когда рука двигала мышь и когда
 //                    нет. Водите мышью кругами с остановками. --prepoll MS: перед каждой попыткой
 //                    MS мс опроса 0x63, команда блокировки - сразу после ответа (как в жизни).
-//     --inject N     N раз: 300 мс круг 1 кГц через эталон (batch 0x6C), стоп. Хвост = от
+//     --inject N     [--dur MS,MS..] [--lag N] [--stop] N раз на каждую длительность: 300 мс круг 1 кГц через эталон (batch 0x6C), стоп. Хвост = от
 //                    последнего принятого move() до последнего отчёта в Windows. Мышь не трогать.
 //     --reflock N    N раз блокировка через эталон, 400 мс, снять; через раз tx.setLock(X) +
 //                    tx.setLock(Y) и tx.setLocks({X, Y}).
 //                    Задержка = от вызова setLock() до последнего физического отсчёта в Windows.
 //                    Всё время водите мышью кругами.
+//     --track S      слежение эталона: tx.setTracking(true), S секунд водите мышью, раз в 1.5 с
+//                    обе оси блокируются на 0.4 с. tx.physical() против Raw Input.
+//     --trackinject N  слежение + N всплесков инжекта по 1 с (мышь не трогать): physical()
+//                    должен остаться 0,0; через сколько слежение снова идёт.
 //
 // Тестовое окно должно быть в фокусе: Raw Input фонового окна Windows 11 прореживает.
 // Курсор заперт в окне. Esc - выход; блокировки снимаются и проверяются снимком 0x56.
@@ -47,7 +51,10 @@ using Q = makcu::detail::Qpc;
 std::atomic<bool> g_stop{false};
 std::atomic<bool> g_cleanDone{false};
 int g_scrW = 0, g_scrH = 0;  // --screen: km.screen на время замера (0 - по умолчанию режима)
-double g_prePollMs = 0.0;    // --prepoll: lockloss опрашивает 0x63 столько мс перед каждой попыткой
+double g_prePollMs = 0.0;              // --prepoll: lockloss опрашивает 0x63 столько мс перед каждой попыткой
+std::vector<int> g_injectDurMs{300};  // --dur: длительности круга в --inject, мс
+std::vector<int> g_maxLags;           // --lag N,N..: tx.setMaxLag() в --inject по очереди (пусто - по умолчанию)
+bool g_stopCall = false;              // --stop: в конце круга tx.stopMovement()
 
 BOOL WINAPI onCtrl(DWORD type) {
     g_stop = true;
@@ -885,18 +892,24 @@ int runInject(const std::string& host, uint16_t port, int trials) {
         std::printf("[-] %s\n", err.c_str());
         return 1;
     }
-    std::printf("[+] эталон: %s\n", tx.info().c_str());
+    std::printf("[+] эталон: %s%s\n", tx.info().c_str(), g_stopCall ? " | в конце stopMovement()" : "");
     say(L"НЕ ТРОГАЙТЕ МЫШЬ", L"курсор будет описывать круги");
     sleepMs(1500.0);
-    std::printf("попытка | отправлено X,Y | Windows X,Y | первый отчёт после 1-го move(), мс | хвост после "
-                "последнего move(): мс / отчётов\n");
+    std::printf("maxLag | длит., мс | отправлено X,Y | Windows X,Y | первый отчёт, мс | хвост после %s: мс / отчётов | "
+                "интервалов 1 мс | склеено | у платы max\n", g_stopCall ? "stopMovement()" : "последнего move()");
     std::vector<double> tails;
-    for (int n = 0; n < trials && !g_stop.load(); ++n) {
+    if (g_maxLags.empty()) g_maxLags.push_back(static_cast<int>(tx.maxLag()));
+    const int perLag = trials * static_cast<int>(g_injectDurMs.size());
+    for (int n = 0; n < perLag * static_cast<int>(g_maxLags.size()) && !g_stop.load(); ++n) {
+        const int lagCap = g_maxLags[static_cast<size_t>(n / perLag)];
+        tx.setMaxLag(static_cast<uint32_t>(lagCap));
+        const int durMs = g_injectDurMs[static_cast<size_t>((n % perLag) / trials)];
         double phase = 0.0, fx = 0.0, fy = 0.0;
         int64_t pendX = 0, pendY = 0, sentX = 0, sentY = 0, tFirst = 0, tLast = 0;
+        const uint64_t merged0 = tx.stats().merged;
         const int64_t tA = Q::now();
         int64_t due = tA;
-        for (int tick = 0; tick < 300 && !g_stop.load(); ++tick) {
+        for (int tick = 0; tick < durMs && !g_stop.load(); ++tick) {
             spinUntil(due);
             due += Q::fromUs(1000.0);
             const double r = 120.0, w = 2.0 * 3.14159265358979 / 300.0;
@@ -916,21 +929,37 @@ int runInject(const std::string& host, uint16_t port, int trials) {
                 pendX = pendY = 0;
             }
         }
+        int64_t tEnd = tLast;
+        if (g_stopCall) {
+            tEnd = Q::now();
+            int32_t ddx = 0, ddy = 0;
+            tx.stopMovement(&ddx, &ddy);
+            sentX -= ddx;  // выброшенное в ПК не попадёт
+            sentY -= ddy;
+        }
         sleepMs(400.0);
         const Track tr = buildTrack(tA, Q::now());
-        int64_t lastT = 0, firstT = 0;
-        size_t after = 0;
+        int64_t lastT = 0, firstT = 0, prevT = 0;
+        size_t after = 0, intervals = 0, oneMs = 0;
         for (size_t i = 0; i < tr.t.size(); ++i) {
             if (!tr.dx[i] && !tr.dy[i]) continue;
             if (!firstT) firstT = tr.t[i];
+            if (prevT && tr.t[i] <= tEnd) {
+                ++intervals;
+                const double us = Q::toUs(tr.t[i] - prevT);
+                if (us >= 500.0 && us < 1500.0) ++oneMs;
+            }
+            prevT = tr.t[i];
             lastT = tr.t[i];
-            if (tr.t[i] > tLast) ++after;
+            if (tr.t[i] > tEnd) ++after;
         }
-        const double tail = lastT ? Q::toUs(lastT - tLast) / 1000.0 : -1.0;
+        const double tail = lastT ? Q::toUs(lastT - tEnd) / 1000.0 : -1.0;
         tails.push_back(tail);
-        std::printf("%7d | %+5lld,%+5lld | %+5lld,%+5lld | %6.2f | %6.2f / %zu%s\n", n, static_cast<long long>(sentX),
-            static_cast<long long>(sentY), static_cast<long long>(tr.cx.back()), static_cast<long long>(tr.cy.back()),
-            firstT ? Q::toUs(firstT - tFirst) / 1000.0 : -1.0, tail, after,
+        const auto st = tx.stats();
+        std::printf("%6d | %9d | %+5lld,%+5lld | %+5lld,%+5lld | %6.2f | %6.2f / %zu | %5.1f %% | %llu | %u%s\n", lagCap, durMs,
+            static_cast<long long>(sentX), static_cast<long long>(sentY), static_cast<long long>(tr.cx.back()),
+            static_cast<long long>(tr.cy.back()), firstT ? Q::toUs(firstT - tFirst) / 1000.0 : -1.0, tail, after,
+            pct(oneMs, intervals), static_cast<unsigned long long>(st.merged - merged0), st.maxBoardQueued,
             (tr.cx.back() != sentX || tr.cy.back() != sentY) ? "  <-- путь не совпал (мышь трогали?)" : "");
     }
     std::printf("%s\n", tx.statsLine().c_str());
@@ -938,7 +967,8 @@ int runInject(const std::string& host, uint16_t port, int trials) {
     say(L"ГОТОВО");
     if (!tails.empty()) {
         std::sort(tails.begin(), tails.end());
-        std::printf("хвост после последнего move(): медиана %.2f мс, max %.2f мс\n", tails[tails.size() / 2], tails.back());
+        std::printf("хвост после %s: медиана %.2f мс, max %.2f мс\n",
+            g_stopCall ? "stopMovement()" : "последнего move()", tails[tails.size() / 2], tails.back());
     }
     return 0;
 }
@@ -1043,6 +1073,172 @@ int runRefLock(const std::string& host, uint16_t port, int cycles) {
     return 0;
 }
 
+// ---- --track / --trackinject: слежение эталона (setTracking/physical) --------------------
+// Один шаг круга 1 кГц (тот же, что в --inject): накопленный остаток в fx/fy.
+struct Circle {
+    double phase = 0.0, fx = 0.0, fy = 0.0;
+    void step(int64_t& ix, int64_t& iy) {
+        const double r = 120.0, w = 2.0 * 3.14159265358979 / 300.0;
+        fx += -r * w * std::sin(phase);
+        fy += r * w * std::cos(phase);
+        phase += w;
+        ix = std::llround(fx);
+        iy = std::llround(fy);
+        fx -= static_cast<double>(ix);
+        fy -= static_cast<double>(iy);
+    }
+};
+
+// Рука водит мышью; раз в 1.5 с обе оси блокируются на 0.4 с. physical() эталона против Raw Input.
+int runTrack(const std::string& host, uint16_t port, double seconds) {
+    makcu::UdpBatchTransport tx;
+    std::string err;
+    if (!tx.open(host, port, err)) {
+        std::printf("[-] %s\n", err.c_str());
+        return 1;
+    }
+    if (!tx.setTracking(true)) {
+        std::printf("[-] setTracking(true) не прошёл\n");
+        return 1;
+    }
+    std::printf("[+] эталон: %s | слежение включено\n", tx.info().c_str());
+    say(L"ВОДИТЕ МЫШЬЮ", L"мышь будет замирать на 0.4 с (блокировка) - продолжайте; за 2 с до конца - стоп");
+    using makcu::LockTarget;
+    std::vector<Poll> polls;
+    uint64_t lastSamples = tx.physical().samples;
+    const int64_t t0 = Q::now(), tEnd = t0 + Q::fromUs(seconds * 1e6);
+    int64_t nextLock = t0 + Q::fromUs(1500000.0), lockT = 0;
+    bool locked = false, stopShown = false;
+    int lockCycles = 0;
+    while (Q::now() < tEnd && !g_stop.load()) {
+        checkEsc();
+        const int64_t now = Q::now();
+        if (!stopShown && now > tEnd - Q::fromUs(2e6)) {
+            say(L"СТОП - НЕ ТРОГАЙТЕ МЫШЬ");
+            stopShown = true;
+        }
+        if (!locked && now >= nextLock && now < tEnd - Q::fromUs(2.5e6)) {
+            tx.setLocks({LockTarget::X, LockTarget::Y}, true);
+            locked = true;
+            lockT = now;
+            ++lockCycles;
+        } else if (locked && now >= lockT + Q::fromUs(400000.0)) {
+            tx.unlockAll();
+            locked = false;
+            nextLock = now + Q::fromUs(1100000.0);
+        }
+        const auto ph = tx.physical();
+        if (ph.samples != lastSamples) {
+            lastSamples = ph.samples;
+            if (ph.live) {
+                Poll p;
+                p.ts = p.tr = ph.sampleQpc;
+                p.x = static_cast<int>(ph.x);
+                p.y = static_cast<int>(ph.y);
+                polls.push_back(p);
+                g_ui.polls = static_cast<uint32_t>(polls.size());
+            }
+        }
+        YieldProcessor();
+    }
+    if (locked) tx.unlockAll();
+    sleepMs(100.0);
+    const auto fin = tx.physical();
+    tx.setTracking(false);
+    std::printf("%s\n", tx.statsLine().c_str());
+    tx.close();
+    say(L"ГОТОВО");
+    if (polls.size() < 10) {
+        std::printf("[-] мало отсчётов слежения\n");
+        return 1;
+    }
+    const Track tr = buildTrack(t0 - Q::fromUs(1e6), Q::now());
+    const double dur = Q::toUs(polls.back().ts - polls.front().ts) / 1e6;
+    std::printf("отсчётов physical(): %zu за %.1f с = %.0f /с (с паузами под блокировкой), блокировок %d\n", polls.size(),
+        dur, static_cast<double>(polls.size()) / dur, lockCycles);
+    printRawRate(tr);
+    // Время ответа на опрос: плата сняла позицию раньше. Сдвиг ищется в fit() шире.
+    std::vector<Poll> shifted = polls;
+    for (Poll& p : shifted) p.ts -= Q::fromUs(2000.0);
+    const Fit f = fit(shifted, tr, -1);
+    printFit("physical() эталона против Raw Input", f);
+    const Poll& last = shifted.back();
+    const size_t kl = tr.upto(last.ts + Q::fromUs(f.lagUs));
+    std::printf("итог (мышь стоит): physical() %+lld,%+lld | расхождение с Raw Input %+lld,%+lld\n",
+        static_cast<long long>(fin.x), static_cast<long long>(fin.y), static_cast<long long>(last.x - tr.cx[kl] - f.offX),
+        static_cast<long long>(last.y - tr.cy[kl] - f.offY));
+    return 0;
+}
+
+// Мышь не трогать: всплески инжекта со смещением, physical() должен остаться 0,0.
+int runTrackInject(const std::string& host, uint16_t port, int trials) {
+    makcu::UdpBatchTransport tx;
+    std::string err;
+    if (!tx.open(host, port, err)) {
+        std::printf("[-] %s\n", err.c_str());
+        return 1;
+    }
+    if (!tx.setTracking(true)) {
+        std::printf("[-] setTracking(true) не прошёл\n");
+        return 1;
+    }
+    std::printf("[+] эталон: %s | слежение включено\n", tx.info().c_str());
+    say(L"НЕ ТРОГАЙТЕ МЫШЬ", L"курсор будет описывать круги");
+    sleepMs(800.0);
+    const auto ph0 = tx.physical();
+    std::printf("попытка | инжект X,Y | Windows X,Y | physical() за попытку | слежение снова через, мс после последнего move()\n");
+    int bad = 0;
+    for (int n = 0; n < trials && !g_stop.load(); ++n) {
+        const auto before = tx.physical();
+        const int64_t tA = Q::now();
+        Circle c;
+        int64_t pendX = 0, pendY = 0, sentX = 0, sentY = 0, tLast = 0, due = tA;
+        for (int tick = 0; tick < 1000 && !g_stop.load(); ++tick) {
+            spinUntil(due);
+            due += Q::fromUs(1000.0);
+            int64_t ix = 0, iy = 0;
+            c.step(ix, iy);
+            pendX += ix;
+            pendY += iy;
+            if ((pendX || pendY) && tx.move(static_cast<int16_t>(pendX), static_cast<int16_t>(pendY))) {
+                tLast = Q::now();
+                sentX += pendX;
+                sentY += pendY;
+                pendX = pendY = 0;
+            }
+        }
+        // Когда слежение снова пошло: первый засчитанный ответ после конца инжекта.
+        double resumeMs = -1.0;
+        const uint64_t s0 = tx.physical().samples;
+        const int64_t waitEnd = Q::now() + Q::fromUs(300000.0);
+        while (Q::now() < waitEnd) {
+            const auto ph = tx.physical();
+            if (ph.samples != s0 && ph.live) {
+                resumeMs = Q::toUs(ph.sampleQpc - tLast) / 1000.0;
+                break;
+            }
+            YieldProcessor();
+        }
+        sleepMs(300.0);
+        const auto after = tx.physical();
+        const Track tr = buildTrack(tA, Q::now());
+        const int64_t dx = after.x - before.x, dy = after.y - before.y;
+        if (dx || dy) ++bad;
+        std::printf("%7d | %+5lld,%+5lld | %+5lld,%+5lld | %+lld,%+lld%s | %6.2f\n", n, static_cast<long long>(sentX),
+            static_cast<long long>(sentY), static_cast<long long>(tr.cx.back()), static_cast<long long>(tr.cy.back()),
+            static_cast<long long>(dx), static_cast<long long>(dy), (dx || dy) ? " <-- инжект попал в физику?" : "",
+            resumeMs);
+    }
+    const auto fin = tx.physical();
+    std::printf("physical() за весь прогон: %+lld,%+lld (должно быть 0,0), попыток с утечкой %d\n",
+        static_cast<long long>(fin.x - ph0.x), static_cast<long long>(fin.y - ph0.y), bad);
+    tx.setTracking(false);
+    std::printf("%s\n", tx.statsLine().c_str());
+    tx.close();
+    say(L"ГОТОВО");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1050,7 +1246,8 @@ int main(int argc, char** argv) {
     std::string host = "192.168.50.175";
     uint16_t port = 8080;
     double accuracyS = 0.0;
-    int lockN = 0, injectN = 0, refLockN = 0;
+    int lockN = 0, injectN = 0, refLockN = 0, trackInjectN = 0;
+    double trackS = 0.0;
     double lossS = 0.0;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) host = argv[++i];
@@ -1060,17 +1257,36 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--lockloss") == 0 && i + 1 < argc) lossS = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--prepoll") == 0 && i + 1 < argc) g_prePollMs = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--reflock") == 0 && i + 1 < argc) refLockN = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--lag") == 0 && i + 1 < argc) {
+            for (char* s = argv[++i]; *s;) {
+                g_maxLags.push_back(std::atoi(s));
+                while (*s && *s != ',') ++s;
+                if (*s == ',') ++s;
+            }
+        }
+        else if (std::strcmp(argv[i], "--stop") == 0) g_stopCall = true;
+        else if (std::strcmp(argv[i], "--track") == 0 && i + 1 < argc) trackS = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--trackinject") == 0 && i + 1 < argc) trackInjectN = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--dur") == 0 && i + 1 < argc) {
+            g_injectDurMs.clear();
+            for (char* s = argv[++i]; *s;) {
+                g_injectDurMs.push_back(std::atoi(s));
+                while (*s && *s != ',') ++s;
+                if (*s == ',') ++s;
+            }
+        }
         else if (std::strcmp(argv[i], "--screen") == 0 && i + 2 < argc) {
             g_scrW = std::atoi(argv[++i]);
             g_scrH = std::atoi(argv[++i]);
         }
         else {
-            std::printf("track_test.exe [--host IP] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N\n");
+            std::printf("track_test.exe [--host IP] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N\n");
             return 2;
         }
     }
-    if (accuracyS <= 0.0 && lockN <= 0 && injectN <= 0 && lossS <= 0.0 && refLockN <= 0) {
-        std::printf("track_test.exe [--host IP] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N\n");
+    if (accuracyS <= 0.0 && lockN <= 0 && injectN <= 0 && lossS <= 0.0 && refLockN <= 0 && trackS <= 0.0 &&
+        trackInjectN <= 0) {
+        std::printf("track_test.exe [--host IP] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N\n");
         return 2;
     }
     SetConsoleCtrlHandler(onCtrl, TRUE);
@@ -1091,6 +1307,10 @@ int main(int argc, char** argv) {
         rc = runInject(host, port, injectN);
     } else if (refLockN > 0) {
         rc = runRefLock(host, port, refLockN);
+    } else if (trackS > 0.0) {
+        rc = runTrack(host, port, trackS);
+    } else if (trackInjectN > 0) {
+        rc = runTrackInject(host, port, trackInjectN);
     } else {
         Board b;
         std::string err;

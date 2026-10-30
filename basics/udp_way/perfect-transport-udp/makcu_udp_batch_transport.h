@@ -2,8 +2,9 @@
 //
 // Один заголовок, без зависимостей кроме WinAPI (Winsock 2). Доставляет целые
 // отчёты (dx, dy) в MAKCU по UDP командой batch 0x6C (V4.097+): до 7 Raw-записей в
-// одной датаграмме, одна квитанция на пакет. Каждый принятый move() = ровно одна
-// запись = ровно один HID-отчёт, мимо интерполятора.
+// одной датаграмме, одна квитанция на пакет. Каждый принятый move() = одна запись =
+// один HID-отчёт, мимо интерполятора; только если очередь отстала на maxLag записей,
+// новая дельта прибавляется к последней неотправленной (путь точный).
 //
 // Что транспорт делает:
 //   - свой UDP-сокет (обёртка RAW: 0x55 + nonce u64 + кадр MAK_API), поток приёма и
@@ -17,6 +18,10 @@
 //   - непринятые платой записи (нет места) возвращаются в начало очереди;
 //     нет квитанции 30 мс - опрос 0x6A(id=0): last_accepted_id показывает, что принято;
 //   - finish(): дослать очередь, дождаться квитанции, освободить хвост записей;
+//   - глубина очереди движения (setMaxLag, по умолчанию 5 записей) и stopMovement():
+//     курсор встаёт через 3-4 мс после последнего move() / stopMovement(), а не через 8;
+//   - физическая мышь (setTracking): опрос позиции платы GET 0x63, пока нет инжекта
+//     движения, накопленные отсчёты - physical();
 //   - чтение кнопок мыши: поток INPUT_STREAM mouse (0x52), события INPUT_CHANGE 0x53
 //     сразу по нажатию; стартовая маска и страховочный опрос (раз в 50 мс) - GET
 //     PHYS_BUTTONS 0x55. Если опрос находит изменения, которых не принесли события
@@ -67,6 +72,8 @@
 // блокировки, переподключение, сброс состояния при open()/close(). Логика движения
 // не менялась. Ревизия 2026-10-30 (4): блокировки направлений движения одной 0x16
 // (колеса - одной 0x17) вместо серии 0x60, пауза после команды без ответа 3 мс.
+// Ревизия 2026-10-30 (5): глубина очереди движения (setMaxLag), stopMovement(),
+// отсчёты физической мыши по позиции платы (setTracking/physical).
 //
 // Происхождение: basics/udp_way/makcu_udp_transport.h (RawUdpTransport,
 // Format::Batch) от 2026-10-12. Не править: новая версия - новая папка.
@@ -93,6 +100,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <initializer_list>
@@ -195,6 +203,8 @@ public:
     static constexpr uint32_t kMinFirmware = 4097;  // первая сборка с 0x6C
     static constexpr size_t kMaxRecords = 7;        // записей в пакете: квитанция освобождает <= 7 строк
     static constexpr size_t kMaxPending = 7;        // очередь move(); полна - move() == false
+    static constexpr uint32_t kDefaultMaxLag = 5;   // глубина очереди движения, записей (setMaxLag): замер 2026-10-30
+    static constexpr int32_t kMergeLimit = 2047;    // склейка не больше этого по оси (поле HID >= 12 бит)
     static constexpr double kLostUs = 30000.0;      // нет квитанции 30 мс - спросить last_accepted_id
     static constexpr double kDefaultButtonPollMs = 50.0;  // страховочный опрос 0x55 (0 - выключить)
     static constexpr double kFallbackPollMs = 5.0;        // опрос, если события 0x53 не доходят
@@ -203,12 +213,19 @@ public:
     static constexpr double kNoReplyGapUs = 3000.0;       // пауза после команды без ответа (2 мс мало, замер 2026-10-30)
     static constexpr double kHeartbeatUs = 250000.0;      // снимок 0x56: сверка кнопок/блокировок + пульс
     static constexpr double kStreamCheckUs = 5000000.0;   // проверка, что поток событий включён
+    static constexpr int kTrackScreen = 32767;            // km.screen на время слежения: позиция в центре
+    static constexpr int kTrackCentre = 16383;            //   (km.screen ставит её в середину), запас +-16k
+    static constexpr int kRecentreIdle = 8000;            // дальше от центра - перецентровать, когда мышь стоит
+    static constexpr int kRecentreForce = 14000;          //   дальше - сразу (иначе край обрежет движение)
+    static constexpr double kPosLostUs = 5000.0;          // нет ответа на 0x63 5 мс - потерян
+    static constexpr double kLockSettleUs = 5000.0;       // оси заблокированы (снимок): ещё столько опрашивать
+    static constexpr double kInjectSettleUs = 2000.0;     // запас после очереди платы до первого опроса
     static constexpr double kLinkLostUs = 750000.0;       // плата молчит столько - связь потеряна
     static constexpr double kReconnectRetryUs = 250000.0; // попытки переподключения
 
     // Снимок счётчиков (stats()).
     struct Stats {
-        uint64_t records = 0;        // принятых move() (= записей = HID-отчётов)
+        uint64_t records = 0;        // записей (= HID-отчётов); move(), прибавленные к записи, - в merged
         uint64_t packets = 0;        // отправлено пакетов 0x6C
         uint64_t admitted = 0;       // записей, принятых платой
         uint64_t receipts = 0;       // квитанций
@@ -224,6 +241,11 @@ public:
         uint64_t termRejected = 0;   // терминальных строк: отказ
         uint64_t moreSet = 0;        // квитанций с флагом more
         uint64_t busy = 0;           // move() == false из-за полной очереди
+        uint64_t merged = 0;         // move() прибавлен к последней неотправленной записи (очередь >= maxLag)
+        uint64_t stopped = 0;        // записей выброшено stopMovement()
+        uint32_t boardQueued = 0;    // в очереди платы по последней квитанции
+        uint32_t maxBoardQueued = 0; // максимум в очереди платы
+        uint32_t maxLag = 0;         // максимум оценки очереди движения при move()
         uint64_t sendErrors = 0;     // send() не прошёл (занят буфер или нет сети)
         uint64_t datagrams = 0;      // всех датаграмм, включая служебные
         uint32_t minFree = 256;      // минимум свободных записей платы по квитанциям (256 - квитанций не было)
@@ -260,6 +282,13 @@ public:
         uint64_t reconnects = 0;       // сколько раз восстановлена
         double lastOutageMs = 0.0;     // длительность последнего обрыва
         uint64_t droppedRecords = 0;   // записей движения сброшено при обрывах
+        // Физическая мышь (setTracking)
+        bool tracking = false;
+        uint64_t posPolls = 0;         // опросов 0x63
+        uint64_t posReplies = 0;       // ответов
+        uint64_t posLost = 0;          // без ответа kPosLostUs
+        uint64_t recentres = 0;        // km.screen заново (позиция ушла далеко от центра)
+        uint64_t clamped = 0;          // ответов с позицией на краю (движение за краем потеряно)
     };
 
     UdpBatchTransport() = default;
@@ -349,6 +378,9 @@ public:
                     (void)sendNoReply(kOpInputStream, restore, 2);
                 }
             }
+            std::lock_guard<std::mutex> tl(trackMutex_);
+            trackOn_ = false;
+            restoreScreenLocked();
         }
         ready_ = false;
         stopRx_ = true;
@@ -357,6 +389,8 @@ public:
         closing_ = false;
         connected_ = false;
         streamRestore_.reset();
+        screenRestore_.reset();
+        trackOn_ = false;
         streamOk_ = false;
         buttonsOk_ = false;
         if (sock_ != INVALID_SOCKET) {
@@ -401,6 +435,62 @@ public:
         pollTicks_.store(ms > 0.0 ? detail::Qpc::fromUs(ms * 1000.0) : 0, std::memory_order_release);
     }
 
+    // ---- физическая мышь: позиция платы GET 0x63 --------------------------------------
+    // Плата ведёт позицию по каждому отчёту мыши, который принял ПК: физика плюс наш инжект,
+    // без того, что спрятала блокировка. Пока включено слежение, транспорт опрашивает её в
+    // свободные слоты цикла, ПОКА НЕТ ИНЖЕКТА ДВИЖЕНИЯ, и копит разности - это отсчёты
+    // физической мыши. Замер 2026-10-30: ~500 опросов/с, сумма совпадает с Raw Input до
+    // отсчёта, между опросами 1-3 отчёта мыши (каждый отчёт отдельно плата не отдаёт).
+    // Инжект: первая же запись move() закрывает отрезок; следующий начнётся, когда плата
+    // отдаст свою очередь. Под полной блокировкой осей позиция не меняется - опрос встаёт
+    // через kLockSettleUs после подтверждения (утёкшие до блокировки отсчёты учтены).
+    // Опрос занимает единственный слот: move()/press()/setLocks() ждут ответа на него (до ~2 мс).
+    // На время слежения km.screen = 32767x32767, при выключении и в close() - прежний
+    // (km.moveto других программ это заденет).
+    struct Physical {
+        int64_t x = 0;          // отсчёты физической мыши с setTracking(true)
+        int64_t y = 0;
+        uint64_t samples = 0;   // ответов 0x63
+        int64_t sampleQpc = 0;  // когда пришёл последний (QueryPerformanceCounter)
+        bool live = false;      // отрезок идёт: последний ответ засчитан и ему меньше 10 мс
+    };
+    // Включить/выключить слежение. Блокирует до ~0.3 с (запрос km.screen). false - нет связи.
+    bool setTracking(bool on) {
+        std::lock_guard<std::mutex> tl(trackMutex_);
+        if (on == trackOn_.load()) return true;
+        if (!on) {
+            trackOn_ = false;
+            restoreScreenLocked();
+            return true;
+        }
+        if (!healthy()) return false;
+        auto r = query(kOpScreen, nullptr, 0, 100, 3);
+        if (!r || r->size() < 4) return false;
+        screenRestore_ = std::make_pair(static_cast<uint16_t>((*r)[0] | (*r)[1] << 8),
+            static_cast<uint16_t>((*r)[2] | (*r)[3] << 8));
+        setTrackScreen();
+        {
+            std::lock_guard<std::mutex> pl(posMutex_);
+            physX_ = physY_ = 0;
+            posSamples_ = 0;
+            posBaseValid_ = false;
+        }
+        trackOn_ = true;
+        kick();
+        return true;
+    }
+    [[nodiscard]] bool tracking() const { return trackOn_.load(); }
+    [[nodiscard]] Physical physical() const {
+        std::lock_guard<std::mutex> pl(posMutex_);
+        Physical r;
+        r.x = physX_;
+        r.y = physY_;
+        r.samples = posSamples_;
+        r.sampleQpc = posSampleT_;
+        r.live = trackOn_.load() && posBaseValid_ && detail::Qpc::now() - posSampleT_ < detail::Qpc::fromUs(10000.0);
+        return r;
+    }
+
     // ---- инжект кнопок (любой поток, не блокируют) -------------------------------------
     // Нажать/отпустить кнопку программно (SET 0x11..0x15). Уходит следующей командой цикла,
     // раньше движения из очереди (ждёт только команду, которая уже в полёте: ~1-2 мс).
@@ -435,12 +525,16 @@ public:
         for (;;) {
             uint16_t next = cur;
             for (const LockTarget t : targets) next = applyLock(next, t, locked);
-            if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) break;
+            if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) {
+                if ((next ^ cur) & kLockMoveDirs) fullLockT_.store(0, std::memory_order_release);
+                break;
+            }
         }
         kick();
     }
     void unlockAll() {
         locksWanted_.store(0, std::memory_order_release);
+        fullLockT_.store(0, std::memory_order_release);
         kick();
     }
     [[nodiscard]] bool locked(LockTarget t) const { return (locksWanted_.load() & lockBit(t)) != 0; }
@@ -448,8 +542,37 @@ public:
     [[nodiscard]] uint16_t locks() const { return locksWanted_.load(); }
     [[nodiscard]] uint16_t locksOnBoard() const { return boardLocks_.load(); }
 
+    // ---- глубина очереди и остановка инжекта (любой поток) ------------------------------
+    // Всё, что принято move() и ещё не ушло в USB (очередь транспорта, пакет в полёте,
+    // очередь платы), выходит в ПК по одной записи на отчёт мыши (1 мс). Это отставание
+    // курсора от вызова и хвост после остановки. Плата отдаёт ровно столько, сколько мы
+    // шлём, поэтому каждая заминка сети оставляла запись в очереди навсегда: за 10 с хвост
+    // дорастал до 8 мс. Если оценка очереди дошла до maxLag записей, новая дельта
+    // прибавляется к последней неотправленной записи: путь точный, отчётов на один меньше.
+    // 0 - не ограничивать (каждый move() - отдельный отчёт).
+    void setMaxLag(uint32_t records) { maxLag_.store(records, std::memory_order_release); }
+    [[nodiscard]] uint32_t maxLag() const { return maxLag_.load(); }
+    // Остановить инжект сейчас: записи, ещё не отправленные плате, выбрасываются - их путь
+    // в ПК не попадёт. Пакет в полёте и очередь платы доиграют (отозвать их у платы нельзя).
+    // Возвращает число выброшенных записей, в dx/dy - их сумму.
+    uint32_t stopMovement(int32_t* droppedDx = nullptr, int32_t* droppedDy = nullptr) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        int32_t sx = 0, sy = 0;
+        for (const Rec& r : pend_) {
+            sx += r.dx;
+            sy += r.dy;
+        }
+        const auto n = static_cast<uint32_t>(pend_.size());
+        pend_.clear();
+        st_.stopped += n;
+        if (droppedDx) *droppedDx = sx;
+        if (droppedDy) *droppedDy = sy;
+        return n;
+    }
+
     // ---- горячий путь -------------------------------------------------------------
-    // true - запись принята и уйдёт ровно одним HID-отчётом. false - очередь полна или
+    // true - дельта принята: отдельной записью (= одним HID-отчётом) или прибавлена к
+    // последней неотправленной, если очередь доросла до maxLag. false - очередь полна или
     // связи нет: дельту хранит вызывающий.
     [[nodiscard]] bool move(int16_t dx, int16_t dy) {
         if (!healthy()) return false;
@@ -460,15 +583,34 @@ public:
         bool accepted = false;
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
-            if (pend_.size() < kMaxPending) {
+            // Оценка очереди: у платы по квитанции минус отданное с тех пор (1 запись/мс),
+            // плюс пакет в полёте, плюс неотправленные.
+            const int64_t sinceReceipt = detail::Qpc::now() - receiptT_;
+            const int64_t emitted = sinceReceipt / detail::Qpc::fromUs(1000.0);
+            const int64_t onBoard = std::max<int64_t>(0, static_cast<int64_t>(boardQueued_) - emitted);
+            const auto lag = static_cast<uint32_t>(onBoard + (flight_.active ? flight_.n : 0) + pend_.size());
+            st_.maxLag = std::max(st_.maxLag, lag);
+            const uint32_t cap = maxLag_.load(std::memory_order_relaxed);
+            if (cap && lag >= cap && !pend_.empty()) {
+                Rec& last = pend_.back();
+                const int32_t nx = last.dx + dx, ny = last.dy + dy;
+                if (std::abs(nx) <= kMergeLimit && std::abs(ny) <= kMergeLimit) {
+                    last.dx = nx;
+                    last.dy = ny;
+                    ++st_.merged;
+                    accepted = true;
+                }
+            }
+            if (!accepted && pend_.size() < kMaxPending) {
                 pend_.push_back(Rec{dx, dy});
                 ++st_.records;
                 st_.maxPending = std::max<uint32_t>(st_.maxPending, static_cast<uint32_t>(pend_.size()));
                 accepted = true;
-            } else {
+            } else if (!accepted) {
                 ++st_.busy;
             }
         }
+        if (accepted) posEpoch_.fetch_add(1, std::memory_order_acq_rel);  // инжект: отрезок физики закрыт
         service();
         return accepted;
     }
@@ -542,33 +684,46 @@ public:
         s.reconnects = reconnects_.load();
         s.lastOutageMs = lastOutageMs_.load();
         s.droppedRecords = droppedRecords_.load();
+        s.tracking = trackOn_.load();
+        s.posPolls = posPolls_.load();
+        s.posLost = posLost_.load();
+        s.recentres = recentres_.load();
+        {
+            std::lock_guard<std::mutex> pl(posMutex_);
+            s.posReplies = posReplies_;
+            s.clamped = clamped_;
+        }
         return s;
     }
 
     [[nodiscard]] std::string statsLine() const {
         const Stats s = stats();
-        char buf[1600];
+        char buf[2200];
         std::snprintf(buf, sizeof(buf),
             "batch 0x6C %s: записей %llu, пакетов %llu (%.2f/пакет), принято платой %llu | квитанций %llu, частичных %llu,"
             " отклонено %llu (X %llu), непонятных %llu | потеряно квитанций %llu, опросов %llu, поздних %llu"
             " | освобождено %llu, мин. свободно %d, more %llu | терминальных: отдано %llu, отказ %llu"
-            " | очередь max %u, сейчас %u, полна %llu раз | RTT ср %.2f max %.2f мс | датаграмм %llu, ошибок send %llu"
+            " | очередь max %u, сейчас %u, полна %llu раз | глубина max %u (предел %u), склеено %llu, остановкой"
+            " выброшено %llu, у платы max %u | RTT ср %.2f max %.2f мс | датаграмм %llu, ошибок send %llu"
             " | посл. причина %u | кнопки %02X: событий %llu, переполнений %llu, опросов %llu, ответов %llu,"
             " потеряно %llu, найдено опросом %llu, изменений %llu%s"
             " | инжект %02X (плата %02X), команд %llu | блокировки %04X (плата %04X), команд %llu"
             " | снимков %llu (потеряно %llu), исправлено %llu, поток событий включён заново %llu"
-            " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu",
+            " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu"
+            " | физика %s: опросов 0x63 %llu, ответов %llu, потеряно %llu, перецентровок %llu, у края %llu",
             endpoint_.c_str(), u(s.records), u(s.packets),
             s.packets ? static_cast<double>(s.records) / static_cast<double>(s.packets) : 0.0, u(s.admitted),
             u(s.receipts), u(s.partial), u(s.envelope), u(s.xRejected), u(s.badReplies), u(s.lostReceipts),
             u(s.metaQueries), u(s.lateReplies), u(s.freed), s.minFree > 255 ? -1 : static_cast<int>(s.minFree),
-            u(s.moreSet), u(s.termSubmitted), u(s.termRejected), s.maxPending, s.pending, u(s.busy), s.rttAvgMs,
+            u(s.moreSet), u(s.termSubmitted), u(s.termRejected), s.maxPending, s.pending, u(s.busy), s.maxLag,
+            maxLag_.load(), u(s.merged), u(s.stopped), s.maxBoardQueued, s.rttAvgMs,
             s.rttMaxMs, u(s.datagrams), u(s.sendErrors), s.lastReason, s.buttons, u(s.buttonEvents),
             u(s.buttonOverflows), u(s.buttonPolls), u(s.buttonReplies), u(s.buttonLost), u(s.buttonMissed),
             u(s.buttonChanges), s.eventsMissing ? " | СОБЫТИЯ НЕ ДОХОДЯТ (брандмауэр?) - опрос 5 мс" : "",
             s.injectWanted, s.injectOnBoard, u(s.buttonCommands), s.locksWanted, s.locksOnBoard, u(s.lockCommands),
             u(s.snapshots), u(s.snapshotLost), u(s.repairs), u(s.streamRestores), s.connected ? "есть" : "НЕТ",
-            u(s.linkLost), u(s.reconnects), s.lastOutageMs, u(s.droppedRecords));
+            u(s.linkLost), u(s.reconnects), s.lastOutageMs, u(s.droppedRecords), s.tracking ? "вкл" : "выкл",
+            u(s.posPolls), u(s.posReplies), u(s.posLost), u(s.recentres), u(s.clamped));
         return buf;
     }
 
@@ -583,6 +738,8 @@ private:
     static constexpr uint8_t kOpMoveMask = 0x16;     // SET left:u8 right:u8 down:u8 up:u8 (без ответа) = биты 7 6 9 10
     static constexpr uint8_t kOpWheelMask = 0x17;    // SET down:u8 up:u8 (без ответа) = биты 13 12
     static constexpr uint8_t kOpLock = 0x60;         // SET target:u8 state:u8 (без ответа); GET target -> state
+    static constexpr uint8_t kOpGetPos = 0x63;       // GET -> x:u16 y:u16 позиция платы (зажата в km.screen)
+    static constexpr uint8_t kOpScreen = 0x64;       // GET -> w:u16 h:u16; SET w h (без ответа): позиция в центр
     static constexpr uint8_t kOpRawAck = 0x6A;       // 0x6A(id=0): метаданные; (id, consume=1): освободить запись
     static constexpr uint8_t kOpBatch = 0x6C;        // V4.097+: пакет Raw-записей + квитанция
 
@@ -679,6 +836,8 @@ private:
             flight_ = Flight{};
             haveX_ = false;
             maxTerm_ = 0;
+            boardQueued_ = 0;
+            receiptT_ = 0;
         }
         // Поток событий мыши: включить (запомнить, каким был при open()), потом маска.
         // Порядок важен: поток начинается с "всё отпущено", маска читается после включения.
@@ -742,7 +901,24 @@ private:
                 info_ += bb;
             }
         }
+        if (!initial && trackOn_.load()) setTrackScreen();  // плата могла перезагрузиться (размер по умолчанию)
         return true;
+    }
+
+    // km.screen = 32767x32767: позиция в центре, отрезок физики начнётся заново.
+    void setTrackScreen() {
+        const uint8_t pl[4] = {kTrackScreen & 0xFF, kTrackScreen >> 8, kTrackScreen & 0xFF, kTrackScreen >> 8};
+        (void)sendNoReply(kOpScreen, pl, 4);
+        posEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    // Под trackMutex_: вернуть km.screen, каким он был до setTracking(true).
+    void restoreScreenLocked() {
+        if (screenRestore_ && connected_.load()) {
+            const uint8_t pl[4] = {static_cast<uint8_t>(screenRestore_->first), static_cast<uint8_t>(screenRestore_->first >> 8),
+                static_cast<uint8_t>(screenRestore_->second), static_cast<uint8_t>(screenRestore_->second >> 8)};
+            (void)sendNoReply(kOpScreen, pl, 4);
+        }
+        screenRestore_.reset();
     }
 
     // Сторожевой поток: связь пропала - переподключиться и восстановить запрошенное.
@@ -779,7 +955,7 @@ private:
         connected_ = false;
         lostT_ = now;
         linkLost_.fetch_add(1, std::memory_order_relaxed);
-        batchSeq_ = metaSeq_ = physSeq_ = snapSeq_ = streamSeq_ = 0;
+        batchSeq_ = metaSeq_ = physSeq_ = snapSeq_ = streamSeq_ = posSeq_ = 0;
         awaitSeq_.store(0, std::memory_order_release);
         std::lock_guard<std::mutex> lock(stateMutex_);
         uint64_t dropped = pend_.size();
@@ -927,6 +1103,14 @@ private:
         const int64_t now = detail::Qpc::now();
         if (const uint64_t a = awaitSeq_.load(std::memory_order_acquire); a != 0) {
             const int64_t waited = now - awaitT_.load(std::memory_order_relaxed);
+            if (a == posSeq_.load(std::memory_order_acquire)) {
+                // Опрос позиции без ответа: позиция на плате копится сама, отсчёты не теряются.
+                if (waited < detail::Qpc::fromUs(kPosLostUs)) return false;
+                posLost_.fetch_add(1, std::memory_order_relaxed);
+                posSeq_ = 0;
+                clearAwait(a);
+                return false;
+            }
             if (a == physSeq_.load(std::memory_order_acquire) || a == snapSeq_.load(std::memory_order_acquire) ||
                 a == streamSeq_.load(std::memory_order_acquire)) {
                 // Опрос/снимок без ответа: забыть его, движение не ждёт (снимок повторится).
@@ -1034,6 +1218,15 @@ private:
             buttonPolls_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
+        // Движения нет и плата отдала свою очередь: опрос позиции физической мыши.
+        if (trackOn_.load(std::memory_order_acquire)) {
+            bool idle = false;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                idle = pend_.empty() && !flight_.active && now >= injectQuietUntil_;
+            }
+            if (idle) return sendTrackLocked(now);
+        }
         Flight f;
         bool haveX = false;
         uint32_t x = 0;
@@ -1125,6 +1318,67 @@ private:
         return true;
     }
 
+    // Под sendMutex_: перецентровка или опрос позиции 0x63 (слежение включено, инжекта нет).
+    bool sendTrackLocked(int64_t now) {
+        // Оси заблокированы целиком, плата подтвердила: физика до ПК не доходит, позиция
+        // стоит - слот оставить инжекту (через kLockSettleUs: утёкшие отсчёты уже учтены).
+        const uint16_t want = locksWanted_.load(std::memory_order_acquire);
+        const int64_t lockedT = fullLockT_.load(std::memory_order_acquire);
+        if ((want & kLockMoveDirs) == kLockMoveDirs && lockedT && now - lockedT > detail::Qpc::fromUs(kLockSettleUs)) {
+            return false;
+        }
+        if (recentreWanted_.exchange(false, std::memory_order_acq_rel)) {
+            const uint8_t pl[4] = {kTrackScreen & 0xFF, kTrackScreen >> 8, kTrackScreen & 0xFF, kTrackScreen >> 8};
+            if (!sendFrameLocked(++seq_, kOpScreen, pl, 4)) {
+                recentreWanted_ = true;
+                return false;
+            }
+            posEpoch_.fetch_add(1, std::memory_order_acq_rel);  // позиция в центре: новый отрезок
+            recentres_.fetch_add(1, std::memory_order_relaxed);
+            gapUntil_ = now + detail::Qpc::fromUs(kNoReplyGapUs);
+            return true;
+        }
+        const uint64_t ps = ++seq_;
+        posSentEpoch_.store(posEpoch_.load(std::memory_order_acquire), std::memory_order_release);
+        posSeq_.store(ps, std::memory_order_release);
+        awaitT_.store(now, std::memory_order_relaxed);
+        awaitSeq_.store(ps, std::memory_order_release);
+        if (!sendFrameLocked(ps, kOpGetPos, nullptr, 0)) {
+            posSeq_.store(0, std::memory_order_relaxed);
+            clearAwait(ps);
+            return false;
+        }
+        posPolls_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Поток приёма: позиция 0x63. Разность с прошлым ответом того же отрезка - физика.
+    // Опрос, отправленный до первого move(), ещё без инжекта (пакет ушёл после ответа):
+    // его засчитать, а отрезок закрыть.
+    void onPos(const uint8_t* p, size_t plen) {
+        if (plen < 4) return;
+        const int x = p[0] | p[1] << 8, y = p[2] | p[3] << 8;
+        const uint64_t e = posSentEpoch_.load(std::memory_order_acquire);
+        const int64_t now = detail::Qpc::now();
+        std::lock_guard<std::mutex> pl(posMutex_);
+        ++posReplies_;
+        const bool same = posBaseValid_ && posBaseEpoch_ == e;
+        if (same) {
+            physX_ += x - posLastX_;
+            physY_ += y - posLastY_;
+        }
+        posStill_ = same && x == posLastX_ && y == posLastY_ ? posStill_ + 1 : 0;
+        posLastX_ = x;
+        posLastY_ = y;
+        posSampleT_ = now;
+        ++posSamples_;
+        posBaseEpoch_ = e;
+        posBaseValid_ = e == posEpoch_.load(std::memory_order_acquire);
+        if (x <= 0 || y <= 0 || x >= kTrackScreen - 1 || y >= kTrackScreen - 1) ++clamped_;
+        const int off = std::max(std::abs(x - kTrackCentre), std::abs(y - kTrackCentre));
+        if (off > kRecentreForce || (off > kRecentreIdle && posStill_ >= 2)) recentreWanted_ = true;
+    }
+
     // Снять ожидание, если ждём именно этот nonce (иначе там уже другая команда).
     void clearAwait(uint64_t seq) {
         uint64_t expected = seq;
@@ -1164,7 +1418,14 @@ private:
     void onSnapshot(const uint8_t* p, size_t plen) {
         if (plen < 3) return;
         boardButtons_.store(static_cast<uint8_t>(p[0] & 0x1F), std::memory_order_release);
-        boardLocks_.store(normalizeLocks(static_cast<uint16_t>(p[1] | p[2] << 8)), std::memory_order_release);
+        const uint16_t locks = normalizeLocks(static_cast<uint16_t>(p[1] | p[2] << 8));
+        boardLocks_.store(locks, std::memory_order_release);
+        if ((locks & kLockMoveDirs) == kLockMoveDirs) {
+            int64_t zero = 0;
+            fullLockT_.compare_exchange_strong(zero, detail::Qpc::now(), std::memory_order_acq_rel);
+        } else {
+            fullLockT_.store(0, std::memory_order_release);
+        }
         boardEpoch_.store(snapEpoch_.load(std::memory_order_acquire), std::memory_order_release);
         snapFresh_.store(true, std::memory_order_release);
     }
@@ -1193,7 +1454,7 @@ private:
         snapFresh_ = false;
         streamReenable_ = false;
         buttonCommands_ = lockCommands_ = snapshots_ = snapshotLost_ = repairs_ = streamRestores_ = 0;
-        batchSeq_ = metaSeq_ = physSeq_ = snapSeq_ = streamSeq_ = 0;
+        batchSeq_ = metaSeq_ = physSeq_ = snapSeq_ = streamSeq_ = posSeq_ = 0;
         awaitSeq_ = 0;
         gapUntil_ = 0;
     }
@@ -1284,6 +1545,12 @@ private:
                 return;
             }
         }
+        if (seq != 0 && seq == posSeq_.load(std::memory_order_acquire)) {
+            onPos(p, plen);
+            posSeq_.store(0, std::memory_order_relaxed);
+            clearAwait(seq);
+            return;
+        }
         if (seq != 0 && seq == physSeq_.load(std::memory_order_acquire)) {
             if (plen == 1) {
                 applyMask(p[0], true);
@@ -1362,6 +1629,11 @@ private:
         }
         st_.freed += p[6];
         st_.minFree = std::min<uint32_t>(st_.minFree, p[7]);
+        boardQueued_ = p[10];
+        receiptT_ = detail::Qpc::now();
+        injectQuietUntil_ = receiptT_ + detail::Qpc::fromUs(p[10] * 1000.0 + kInjectSettleUs);
+        st_.boardQueued = p[10];
+        st_.maxBoardQueued = std::max<uint32_t>(st_.maxBoardQueued, p[10]);
         if (p[9]) ++st_.moreSet;
         for (size_t i = 0; i < k && 16 + 6 * i + 6 <= plen; ++i) {
             const uint8_t* row = p + 16 + 6 * i;
@@ -1386,6 +1658,8 @@ private:
             requeueLocked(f, adm);
             nextId_ = std::max(f.firstId + adm, lastAccepted + 1);
         }
+        // Очередь платы неизвестна (квитанция потеряна): до опроса позиции - вся ёмкость, 16 мс.
+        injectQuietUntil_ = detail::Qpc::now() + detail::Qpc::fromUs(16000.0 + kInjectSettleUs);
         settleLocked();
     }
 
@@ -1407,6 +1681,7 @@ private:
     std::atomic<uint64_t> physSeq_{0};    // nonce опроса кнопок 0x55
     std::atomic<uint64_t> snapSeq_{0};    // nonce снимка 0x56
     std::atomic<uint64_t> streamSeq_{0};  // nonce проверки потока 0x52
+    std::atomic<uint64_t> posSeq_{0};     // nonce опроса позиции 0x63
     int64_t gapUntil_ = 0;                // под sendMutex_: до этого момента не слать (после команды без ответа)
     int64_t nextPollT_ = 0;               // под sendMutex_: когда следующий опрос кнопок
     int64_t nextSnapT_ = 0;               // под sendMutex_: когда следующий пульс-снимок
@@ -1445,6 +1720,23 @@ private:
     std::atomic<uint64_t> buttonCommands_{0}, lockCommands_{0}, snapshots_{0}, snapshotLost_{0}, repairs_{0},
         streamRestores_{0};
 
+    // Физическая мышь (слежение по позиции платы)
+    std::mutex trackMutex_;                          // setTracking/close: km.screen
+    std::optional<std::pair<uint16_t, uint16_t>> screenRestore_;  // под trackMutex_: km.screen до слежения
+    std::atomic<bool> trackOn_{false};
+    std::atomic<uint64_t> posEpoch_{0};              // растёт на move() и перецентровке: отрезок закрыт
+    std::atomic<uint64_t> posSentEpoch_{0};          // posEpoch_ на момент отправки опроса
+    std::atomic<bool> recentreWanted_{false};
+    std::atomic<int64_t> fullLockT_{0};              // снимок впервые показал обе оси заблокированными
+    std::atomic<uint64_t> posPolls_{0}, posLost_{0}, recentres_{0};
+    mutable std::mutex posMutex_;                    // всё ниже - под ним (пишет поток приёма)
+    int64_t physX_ = 0, physY_ = 0;
+    uint64_t posSamples_ = 0, posReplies_ = 0, clamped_ = 0;
+    int64_t posSampleT_ = 0;
+    int posLastX_ = 0, posLastY_ = 0, posStill_ = 0;
+    bool posBaseValid_ = false;
+    uint64_t posBaseEpoch_ = 0;
+
     // Связь
     std::atomic<bool> connected_{false};
     std::atomic<int64_t> lastRxT_{0};
@@ -1465,6 +1757,10 @@ private:
 
     mutable std::mutex stateMutex_;  // очередь, пакет в полёте, X, счётчики
     std::deque<Rec> pend_;
+    uint32_t boardQueued_ = 0;   // под stateMutex_: в очереди платы по последней квитанции
+    int64_t receiptT_ = 0;       //   и когда она пришла
+    std::atomic<uint32_t> maxLag_{kDefaultMaxLag};
+    int64_t injectQuietUntil_ = 0;  // под stateMutex_: плата отдаст очередь движения к этому моменту
     Flight flight_;
     uint32_t nextId_ = 1;
     uint32_t maxTerm_ = 0;  // старший терминальный id из квитанций
