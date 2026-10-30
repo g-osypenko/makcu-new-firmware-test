@@ -313,6 +313,13 @@ Install a Ctrl+C and console-close handler that calls `close()`.
 For comparison on the same board: Raw `0x69` over UDP in a closed loop ~284 Hz, `0x18` is exact up to ~280–300 commands/s.
 Full tables: [`../MAKCU_RESPONSE_UDP.md`](../MAKCU_RESPONSE_UDP.md), section 4.
 
+## Recheck 2026-10-30 and known limits
+
+*Short summary; see [`README.md`](README.md).* Tail 3.4–4.5 ms with the mouse still, 4.1–5.7 ms with clicks and locks during movement (they cause
+6–10 ms pauses), **6–9 ms with a hand on the mouse** (10–12 ms without a cap). `SET km.screen` is not verified, so a lost datagram goes unnoticed.
+On firmware 4097 the board's USB3 can hang during long movement (mouse and network die until a replug), so `--soak` and `--reconnect` with tracking
+have not been completed on revision 5. No report holes of 12 ms or more in ~230 s, which is not conclusive.
+
 ## Self-check
 
 ```

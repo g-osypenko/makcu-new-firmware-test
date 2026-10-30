@@ -2,7 +2,7 @@
 
 Two single-header C++ transports that move the cursor through a **MAKCU** board at **~1000 Hz** with an **exact path** (every count you send arrives in Windows), and read, inject and lock mouse buttons. One works over the COM port (USB2), the other over Ethernet (UDP). Both have the same API, depend only on WinAPI, and can be used in one program.
 
-> Русская документация: [CONTEXT_AND_SETUP.md](CONTEXT_AND_SETUP.md). English entry point with the full setup: [ENG_CONTEXT_AND_SETUP.md](ENG_CONTEXT_AND_SETUP.md).
+> Instructions for an LLM: [CLAUDE.md](CLAUDE.md). Русская документация: [CONTEXT_AND_SETUP.md](CONTEXT_AND_SETUP.md). English entry point with the full setup: [ENG_CONTEXT_AND_SETUP.md](ENG_CONTEXT_AND_SETUP.md).
 
 ## Take these
 

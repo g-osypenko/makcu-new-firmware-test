@@ -68,7 +68,7 @@ themselves** after a drop (UDP — the network, COM — USB2 unplugged) and rest
 
 Details and measurements: [`ENG_HANDOFF_MOUSE_TRACKING.md`](ENG_HANDOFF_MOUSE_TRACKING.md).
 
-COM revision 5 was verified on hardware on 2026-10-30, including `--soak 5`; tables are in the reference README. **Open COM problem:** at 1 kHz a run of reports occasionally vanishes (32 or ~100–113 ms, about once per 2.5 min, in clusters) while the board reports everything as sent, in both revisions; the cause is unknown. Revision 3 status as of 2026-10-12:
+COM revision 5 was verified on hardware on 2026-10-30, including `--soak 5`; tables are in the reference README. **Open COM problem:** at 1 kHz a run of reports occasionally vanishes (32 or ~100–113 ms, about once per 2.5 min, in clusters) while the board reports everything as sent, in both revisions; the cause is unknown. **Over UDP:** tail 6–9 ms with a hand on the mouse; the board's USB3 can hang during long runs on 4097 (mouse and network die until a replug); the owner is not updating the firmware for now. LLM instructions: [`CLAUDE.md`](CLAUDE.md), [`ENG_CLAUDE.md`](ENG_CLAUDE.md). Revision 3 status as of 2026-10-12:
 
 | | UDP revision 3 | COM revision 3 |
 | --- | --- | --- |

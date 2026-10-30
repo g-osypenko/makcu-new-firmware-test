@@ -144,7 +144,7 @@ reference [`README.md`](basics/comport_way/perfect-transport-comport/README.md).
 | Why it grows | network stalls | **clock drift**, ~45 ppm, 1 record per ~25 s |
 | Tail with the cap | 3.6–4.3 ms | **0.7–1.6 ms** (`setMaxLag(1)`) |
 | `stopMovement()` | 2.7–3.6 ms | **1.10 ms, max 1.60** |
-| Hand on the mouse during injection | not measured | **4.5–5.4 ms**, the cap does not help |
+| Hand on the mouse during injection | **6.0–9.0 ms** (10–12 without a cap) | **4.5–5.4 ms**, the cap does not help |
 | `0x63` back to back | ~509 Hz | **6295 Hz** |
 | `physical()` in the reference | ~475/s | ~1700/s, every mouse report separately |
 | `setLocks({X, Y})` | 1.3 ms, max 2.3 | 0.42 ms, max 0.95 |
@@ -158,7 +158,11 @@ button presses take slots too and are now counted (tail with clicks during movem
 the board reports everything as sent. Revision 3: 2 in ~506 s; revision 5: 10 in ~1530 s, within chance. PC or board: not
 established.
 
-**Next:** find where the reports are lost; the full `controls_test --soak 30`; the hand-on-mouse tail over UDP.
+**UDP recheck (2026-10-30):** tail 3.4–4.5 ms with the mouse still, 4.1–5.7 ms with clicks during movement, 6–9 ms with a hand on the mouse;
+no holes of 12 ms or more in ~230 s, which is not conclusive. The long run was cut off at ~65 s when the board's USB3 hung (mouse and network
+gone, replug needed). The owner is not updating the firmware for now.
+
+**Next:** check G HUB as a cause of the holes; a lower `setMaxLag` with a hand over UDP; verify `km.screen` in the UDP reference; the soak runs.
 
 ## What to measure
 

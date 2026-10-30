@@ -870,7 +870,8 @@ int runInject(int trials) {
         if (g_mark) {
             spinUntil(due);
             pendX += kMarkDx;
-            while (!tx.move(static_cast<int16_t>(pendX), static_cast<int16_t>(pendY)) && !g_stop.load()) YieldProcessor();
+            const int64_t giveUp = Q::now() + Q::fromUs(1e6);  // связь пропала: не ждать вечно
+            while (!tx.move(static_cast<int16_t>(pendX), static_cast<int16_t>(pendY)) && !g_stop.load() && Q::now() < giveUp) YieldProcessor();
             tEnd = tLast = Q::now();
             sentX += pendX;
             sentY += pendY;
